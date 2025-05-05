@@ -157,16 +157,14 @@ class MainWindow(QWidget):
         super().__init__()
 
         self.setWindowTitle("Llama Runner")
+        self.resize(800, 600)  # Set initial window size
 
         self.config = load_config()
         self.llama_runtimes = self.config.get("llama-runtimes", {})
         self.default_runtime = "llama-server"  # Default to llama-server from PATH
-        self.model_name = "test-model"  # hardcoded for now
-        self.model_config = self.config.get("models", {}).get(self.model_name, {})
-        self.model_path = self.model_config.get("model_path")
-        self.llama_cpp_runtime = self.llama_runtimes.get(self.model_config.get("llama_cpp_runtime", "default"), self.default_runtime)
+        self.models = self.config.get("models", {})
 
-        self.llama_runner_thread = None
+        self.llama_runner_threads = {}  # Dictionary to store threads for each model
         self.litellm_proxy_thread = None
 
         self.layout = QVBoxLayout()
@@ -176,15 +174,35 @@ class MainWindow(QWidget):
         # Llama Runner Tab
         self.llama_tab = QWidget()
         self.llama_layout = QVBoxLayout()
-        self.llama_layout.addWidget(QLabel("Llama Runner Status:"))
-        self.llama_status_label = QLabel("Not Running")
-        self.llama_layout.addWidget(self.llama_status_label)
-        self.llama_port_label = QLabel("Port: N/A")  # Add a label for the port
-        self.llama_layout.addWidget(self.llama_port_label)
-        self.llama_start_button = QPushButton("Start Llama Runner")
-        self.llama_stop_button = QPushButton("Stop Llama Runner")
-        self.llama_layout.addWidget(self.llama_start_button)
-        self.llama_layout.addWidget(self.llama_stop_button)
+        self.llama_layout.addWidget(QLabel("Llama Runners:"))
+
+        self.model_buttons = {}
+        self.model_status_labels = {}
+        self.model_port_labels = {}
+
+        for model_name, model_config in self.models.items():
+            model_button_layout = QVBoxLayout()
+            model_label = QLabel(f"{model_name}:")
+            model_button_layout.addWidget(model_label)
+
+            status_label = QLabel("Not Running")
+            model_button_layout.addWidget(status_label)
+            self.model_status_labels[model_name] = status_label
+
+            port_label = QLabel("Port: N/A")
+            model_button_layout.addWidget(port_label)
+            self.model_port_labels[model_name] = port_label
+
+            start_button = QPushButton(f"Start {model_name}")
+            start_button.clicked.connect(lambda checked, name=model_name: self.start_llama_runner(name))
+            model_button_layout.addWidget(start_button)
+            self.model_buttons[model_name] = start_button
+
+        self.stop_all_button = QPushButton("Stop All Llama Runners")
+        self.stop_all_button.clicked.connect(self.stop_all_llama_runners)
+        self.llama_layout.addStretch()  # Add stretch to push buttons to the top
+        self.llama_layout.addLayout(model_button_layout)
+        self.llama_layout.addWidget(self.stop_all_button)
         self.llama_tab.setLayout(self.llama_layout)
         self.tabs.addTab(self.llama_tab, "Llama Runner")
 
