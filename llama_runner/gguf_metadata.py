@@ -17,8 +17,8 @@ except ImportError:
 # Attempt to import the gguf library and specific components
 try:
     from gguf import GGUFReader
-    # Corrected import: Use LlamaFileType instead of GGMLQuantizationType
-    from gguf.gguf_reader import LlamaFileType # Import the correct enum
+    # Corrected import path: Use gguf.constants for LlamaFileType
+    from gguf.constants import LlamaFileType # Import the correct enum from constants
     GGUF_AVAILABLE = True
     logging.debug("Successfully imported GGUFReader and LlamaFileType.") # Debug log for success
 except ImportError as e:
