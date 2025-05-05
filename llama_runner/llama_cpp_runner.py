@@ -122,6 +122,12 @@ class LlamaCppRunner:
         """
         return self.process is not None and self.process.poll() is None
 
+    def get_port(self):
+        """
+        Returns the port number of the llama.cpp server.
+        """
+        return self.port
+
 async def main():
     """
     Main function to demonstrate the usage of LlamaCppRunner.
@@ -144,8 +150,8 @@ async def main():
     )
 
     await runner.start()
-    await asyncio.sleep(10)  # Run for 10 seconds
-    await runner.stop()
+    # await asyncio.sleep(10)  # Run for 10 seconds # REMOVE THIS LINE
+    # await runner.stop() # REMOVE THIS LINE
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# if __name__ == "__main__": # REMOVE THIS LINE
+#    asyncio.run(main()) # REMOVE THIS LINE
