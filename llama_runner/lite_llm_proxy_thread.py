@@ -71,7 +71,7 @@ async def _get_lmstudio_model_handler(model_id: str, request: Request):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal Server Error retrieving model metadata")
 
 
-# --- New handler for dynamic routing of /v1/* requests ---
+# --- Handler for dynamic routing of /v1/* requests ---
 async def _dynamic_route_v1_request(request: Request):
     """
     Intercepts /v1/* requests, ensures the target runner is running,
@@ -231,24 +231,63 @@ async def _dynamic_route_v1_request(request: Request):
             logging.error(f"Unexpected error during request forwarding for {model_name}: {e}\n{traceback.format_exc()}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal error processing request for model '{model_name}': {e}")
 
-# --- End new handler ---
+# --- End handler for /v1/* requests ---
 
-# --- New handlers for /api/v0/* redirects ---
-async def _redirect_v0_chat_completions(request: Request):
-    """Redirects /api/v0/chat/completions to /v1/chat/completions."""
-    logging.debug("Redirecting /api/v0/chat/completions to /v1/chat/completions")
-    return RedirectResponse(url="/v1/chat/completions", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
-async def _redirect_v0_completions(request: Request):
-    """Redirects /api/v0/completions to /v1/completions."""
-    logging.debug("Redirecting /api/v0/completions to /v1/completions")
-    return RedirectResponse(url="/v1/completions", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+# --- Handlers for /api/v0/* proxying ---
+# These handlers will call the _dynamic_route_v1_request handler internally
+async def _proxy_v0_chat_completions(request: Request):
+    """Proxies /api/v0/chat/completions to /v1/chat/completions."""
+    logging.debug("Proxying /api/v0/chat/completions to /v1/chat/completions")
+    # Modify the request URL path to /v1/chat/completions before passing to the dynamic router
+    # Create a new Request object with the modified URL path
+    # Note: Creating a new Request object and copying state is complex.
+    # A simpler approach is to modify the path on the original request object if possible,
+    # or pass the target path explicitly to the dynamic router.
+    # Let's modify the request.url.path temporarily for the call. This might have side effects.
+    # A cleaner way is to pass the target path to _dynamic_route_v1_request.
+    # Let's refactor _dynamic_route_v1_request to accept a target_path.
 
-async def _redirect_v0_embeddings(request: Request):
-    """Redirects /api/v0/embeddings to /v1/embeddings."""
-    logging.debug("Redirecting /api/v0/embeddings to /v1/embeddings")
-    return RedirectResponse(url="/v1/embeddings", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
-# --- End new handlers ---
+    # --- Refactoring _dynamic_route_v1_request to accept target_path ---
+    # This requires changing the signature of _dynamic_route_v1_request
+    # and updating where it's called.
+
+    # Let's stick to the simpler approach for now: modify the request path temporarily.
+    # This is less ideal but avoids a larger refactor.
+    original_path = request.url.path
+    request.scope['path'] = "/v1/chat/completions"
+    try:
+        response = await _dynamic_route_v1_request(request)
+        return response
+    finally:
+        # Restore the original path
+        request.scope['path'] = original_path
+
+
+async def _proxy_v0_completions(request: Request):
+    """Proxies /api/v0/completions to /v1/completions."""
+    logging.debug("Proxying /api/v0/completions to /v1/completions")
+    original_path = request.url.path
+    request.scope['path'] = "/v1/completions"
+    try:
+        response = await _dynamic_route_v1_request(request)
+        return response
+    finally:
+        request.scope['path'] = original_path
+
+
+async def _proxy_v0_embeddings(request: Request):
+    """Proxies /api/v0/embeddings to /v1/embeddings."""
+    logging.debug("Proxying /api/v0/embeddings to /v1/embeddings")
+    original_path = request.url.path
+    request.scope['path'] = "/v1/embeddings"
+    try:
+        response = await _dynamic_route_v1_request(request)
+        return response
+    finally:
+        request.scope['path'] = original_path
+
+# --- End handlers for /api/v0/* proxying ---
 
 
 # Add LM Studio compatible routes to the global FastAPI app instance
@@ -262,19 +301,20 @@ if "/api/v0/models" not in existing_routes:
 else:
      logging.info("LM Studio compatible API routes already exist.")
 
-# --- Add redirect routes for /api/v0/* endpoints ---
+# --- Add proxy routes for /api/v0/* endpoints ---
+# These replace the previous redirect routes.
 # Add these *before* the /v1/* dynamic routing handlers if possible,
 # although the paths are distinct so order shouldn't strictly matter here.
 if "/api/v0/chat/completions" not in existing_routes:
-    app.add_api_route("/api/v0/chat/completions", _redirect_v0_chat_completions, methods=["POST"])
-    logging.info("Added redirect handler for /api/v0/chat/completions.")
+    app.add_api_route("/api/v0/chat/completions", _proxy_v0_chat_completions, methods=["POST"])
+    logging.info("Added proxy handler for /api/v0/chat/completions.")
 if "/api/v0/completions" not in existing_routes:
-    app.add_api_route("/api/v0/completions", _redirect_v0_completions, methods=["POST"])
-    logging.info("Added redirect handler for /api/v0/completions.")
+    app.add_api_route("/api/v0/completions", _proxy_v0_completions, methods=["POST"])
+    logging.info("Added proxy handler for /api/v0/completions.")
 if "/api/v0/embeddings" not in existing_routes:
-    app.add_api_route("/api/v0/embeddings", _redirect_v0_embeddings, methods=["POST"])
-    logging.info("Added redirect handler for /api/v0/embeddings.")
-# --- End add redirect routes ---
+    app.add_api_route("/api/v0/embeddings", _proxy_v0_embeddings, methods=["POST"])
+    logging.info("Added proxy handler for /api/v0/embeddings.")
+# --- End add proxy routes ---
 
 
 # --- Add routes for /v1/* endpoints to be intercepted ---
@@ -303,14 +343,27 @@ our_v1_routes_added = False
 # Check if our dynamic handlers are already added to avoid duplicates on reload/restart
 # This check is fragile, a better approach might be needed if routes are added dynamically elsewhere
 dynamic_v1_paths = ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"]
-if not any(path in existing_routes for path in dynamic_v1_paths):
+# Check if the *handler function itself* is already associated with the path
+# This is a more robust check than just checking the path string
+current_v1_handlers = {route.path: route.endpoint for route in app.routes if route.path in dynamic_v1_paths}
+
+if current_v1_handlers.get("/v1/chat/completions") != _dynamic_route_v1_request:
     app.add_api_route("/v1/chat/completions", _dynamic_route_v1_request, methods=["POST"])
-    app.add_api_route("/v1/completions", _dynamic_route_v1_request, methods=["POST"]) # Completions is usually POST
-    app.add_api_route("/v1/embeddings", _dynamic_route_v1_request, methods=["POST"]) # Embeddings is usually POST
-    logging.info("Added dynamic routing handlers for /v1/chat/completions, /v1/completions, /v1/embeddings.")
+    logging.info("Added dynamic routing handler for /v1/chat/completions.")
     our_v1_routes_added = True
-else:
-    logging.info("Dynamic routing handlers for /v1/* already exist.")
+
+if current_v1_handlers.get("/v1/completions") != _dynamic_route_v1_request:
+    app.add_api_route("/v1/completions", _dynamic_route_v1_request, methods=["POST"]) # Completions is usually POST
+    logging.info("Added dynamic routing handler for /v1/completions.")
+    our_v1_routes_added = True
+
+if current_v1_handlers.get("/v1/embeddings") != _dynamic_route_v1_request:
+    app.add_api_route("/v1/embeddings", _dynamic_route_v1_request, methods=["POST"]) # Embeddings is usually POST
+    logging.info("Added dynamic routing handler for /v1/embeddings.")
+    our_v1_routes_added = True
+
+if not our_v1_routes_added:
+     logging.info("Dynamic routing handlers for /v1/* already exist.")
 
 
 # If needed, add a catch-all for other /v1 paths, but be cautious
