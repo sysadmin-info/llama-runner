@@ -3,6 +3,7 @@ import os
 import subprocess
 import logging
 import re
+import collections # Import collections
 from typing import Dict, Any
 
 from llama_runner.config_loader import load_config, CONFIG_DIR, LOG_FILE
@@ -30,7 +31,7 @@ class LlamaCppRunner:
         self.process: subprocess.Popen = None
         self.startup_pattern = re.compile(r"main: server is listening on")  # Regex to detect startup
         self.port = None #Dynamically assigned port
-        self._last_output_line = None # Store the last line read from stdout
+        self._output_buffer = collections.deque(maxlen=10) # Store the last 10 lines read from stdout
 
     async def start(self):
         """
@@ -64,6 +65,9 @@ class LlamaCppRunner:
         print(f"Starting llama.cpp server with command: {' '.join(command)}")
         logging.info(f"Starting llama.cpp server with command: {' '.join(command)}")
 
+        # Clear the output buffer before starting a new process
+        self._output_buffer.clear()
+
         try:
             # Use asyncio.create_subprocess_exec for better integration with asyncio
             # Need to capture stdout/stderr for reading
@@ -81,10 +85,8 @@ class LlamaCppRunner:
             # If startup wasn't successful, check if the process exited immediately
             if not startup_success and self.process.returncode is not None:
                  # Process exited before startup message
-                 error_msg = f"Llama.cpp server for {self.model_name} exited immediately with code {self.process.returncode}."
-                 if self._last_output_line:
-                     error_msg += f" Last output: '{self._last_output_line}'"
-                 raise RuntimeError(error_msg)
+                 # The error message will be generic, the UI will show the buffer
+                 raise RuntimeError(f"Llama.cpp server for {self.model_name} exited during startup.")
 
             # If startup_success is False here, it means the process is running but didn't print the expected line
             # This case is handled in wait_for_server_startup by returning False
@@ -146,7 +148,7 @@ class LlamaCppRunner:
                     return False
 
                 decoded_line = line.decode('utf-8', errors='replace').strip()
-                self._last_output_line = decoded_line # Store the last line
+                self._output_buffer.append(decoded_line) # Store the line in the buffer
 
                 print(f"llama.cpp[{self.model_name}]: {decoded_line}")
 
@@ -161,6 +163,7 @@ class LlamaCppRunner:
                     else:
                          # Startup line found, but port not extracted - this is also a failure
                          print(f"Warning: Startup line found but port could not be extracted for {self.model_name}.")
+                         # The error message will be generic, the UI will show the buffer
                          return False # Indicate failure if port isn't found
 
                     return True # Startup successful
@@ -173,6 +176,7 @@ class LlamaCppRunner:
         except Exception as e:
             print(f"Error during startup wait for {self.model_name}: {e}")
             logging.error(f"Error during startup wait for {self.model_name}: {e}")
+            # The error message will be generic, the UI will show the buffer
             return False # Indicate failure
 
 
@@ -222,13 +226,12 @@ class LlamaCppRunner:
     def get_last_output_line(self):
         """
         Returns the last line read from the process's stdout during startup wait.
+        (Deprecated, use get_output_buffer instead)
         """
-        return self._last_output_line
+        return self._output_buffer[-1] if self._output_buffer else None
 
-
-# The main function is now in main.py
-# async def main():
-#    pass # REMOVE
-
-# if __name__ == "__main__": # REMOVE THIS LINE
-#    asyncio.run(main()) # REMOVE THIS LINE
+    def get_output_buffer(self):
+        """
+        Returns the list of lines currently in the output buffer.
+        """
+        return list(self._output_buffer)

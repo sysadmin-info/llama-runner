@@ -11,7 +11,8 @@ from litellm.proxy.proxy_server import app
 import uvicorn
 
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel,
-                               QPushButton, QLineEdit, QTabWidget, QMessageBox) # Import QMessageBox
+                               QPushButton, QLineEdit, QTabWidget, QMessageBox,
+                               QDialog, QTextEdit, QDialogButtonBox) # Import necessary widgets for custom dialog
 from PySide6.QtCore import QThread, QObject, Signal, Slot
 
 from llama_runner.config_loader import load_config
@@ -20,13 +21,46 @@ from llama_runner.llama_cpp_runner import LlamaCppRunner
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+class ErrorOutputDialog(QDialog):
+    """
+    Custom dialog to display error message and process output.
+    """
+    def __init__(self, title, message, output_lines, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(400) # Give it a reasonable minimum width
+        self.setMinimumHeight(200) # Give it a reasonable minimum height
+
+        layout = QVBoxLayout()
+
+        message_label = QLabel(message)
+        layout.addWidget(message_label)
+
+        if output_lines:
+            output_text_edit = QTextEdit()
+            output_text_edit.setReadOnly(True)
+            output_text_edit.setPlainText("\n".join(output_lines))
+            output_text_edit.setMinimumHeight(100) # Ensure text box has some height
+            output_text_edit.setSizePolicy(output_text_edit.sizePolicy().horizontalPolicy(), output_text_edit.sizePolicy().verticalPolicy()) # Allow vertical expansion
+
+            layout.addWidget(QLabel("Last Output Lines:")) # Label for the text box
+            layout.addWidget(output_text_edit)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok)
+        button_box.accepted.connect(self.accept)
+        layout.addWidget(button_box)
+
+        self.setLayout(layout)
+
+
 class LlamaRunnerThread(QThread):
     """
     QThread to run the LlamaCppRunner in a separate thread to avoid blocking the UI.
     """
     started = Signal()
     stopped = Signal()
-    error = Signal(str)
+    # Modified error signal to include output buffer
+    error = Signal(str, list)
     port_ready = Signal(int)
 
     def __init__(self, model_name: str, model_path: str, llama_cpp_runtime: str = None, **kwargs):
@@ -53,8 +87,10 @@ class LlamaRunnerThread(QThread):
         except Exception as e:
             # This catch is mostly for unexpected errors in the asyncio loop itself
             logging.error(f"Unexpected error in LlamaRunnerThread run: {e}\n{traceback.format_exc()}")
+            # If an error occurred here and not in run_async, emit a generic error
             if not self._error_emitted:
-                 self.error.emit(f"Unexpected thread error: {e}")
+                 # Pass an empty list for output buffer in this case
+                 self.error.emit(f"Unexpected thread error: {e}", [])
                  self._error_emitted = True
         finally:
             self.is_running = False
@@ -83,11 +119,8 @@ class LlamaRunnerThread(QThread):
             # The runner.start() method now handles the case where the process exits immediately
             # This check is for cases where the process starts but doesn't print the expected line
             if self.runner.port is None:
-                 last_line = self.runner.get_last_output_line()
-                 error_msg = "Llama.cpp server startup message not found or port not extracted."
-                 if last_line:
-                     error_msg += f" Last output line: '{last_line}'"
-                 raise RuntimeError(error_msg)
+                 # The error message is now generic, the UI will show the buffer
+                 raise RuntimeError("Llama.cpp server failed to start or extract port.")
 
 
             self.started.emit()
@@ -106,7 +139,9 @@ class LlamaRunnerThread(QThread):
 
         except Exception as e:
             logging.error(f"Error running LlamaCppRunner: {e}\n{traceback.format_exc()}")
-            self.error.emit(str(e))  # Emit the error message
+            # Emit the error message and the output buffer
+            output_buffer = self.runner.get_output_buffer() if self.runner else []
+            self.error.emit(str(e), output_buffer)
             self._error_emitted = True # Set flag
 
         finally:
@@ -121,14 +156,12 @@ class LlamaRunnerThread(QThread):
 
             # Check the final return code after ensuring the process is stopped
             # Only emit error if one hasn't been emitted by the except block
-            # Check self.runner.process exists before accessing returncode
+            # Check self.runner and self.runner.process exists before accessing returncode
             if not self._error_emitted and self.runner and self.runner.process and self.runner.process.returncode != 0:
                 error_message = f"Llama.cpp server for {self.model_name} exited with code {self.runner.process.returncode}"
-                last_line = self.runner.get_last_output_line()
-                if last_line:
-                    error_message += f". Last output line: '{last_line}'"
+                output_buffer = self.runner.get_output_buffer() if self.runner else []
                 logging.error(error_message)
-                self.error.emit(error_message)
+                self.error.emit(error_message, output_buffer)
                 self._error_emitted = True # Set flag
 
             self.is_running = False # Ensure this is false
@@ -397,7 +430,8 @@ class MainWindow(QWidget):
         # Connect signals using partial or lambda to pass model_name
         thread.started.connect(lambda: self.on_llama_runner_started(model_name))
         thread.stopped.connect(lambda: self.on_llama_runner_stopped(model_name))
-        thread.error.connect(lambda msg: self.on_llama_runner_error(model_name, msg))
+        # Connect the error signal with the new signature
+        thread.error.connect(lambda msg, output: self.on_llama_runner_error(model_name, msg, output))
         thread.port_ready.connect(lambda port: self.on_llama_runner_port_ready(model_name, port))
 
         self.llama_runner_threads[model_name] = thread
@@ -534,15 +568,23 @@ class MainWindow(QWidget):
             print(f"Stopped signal received for unknown or already cleaned up model: {model_name}")
 
 
-    @Slot(str, str) # Slot receives model_name and message
-    def on_llama_runner_error(self, model_name: str, message: str):
+    @Slot(str, str, list) # Slot receives model_name, message, and output_buffer
+    def on_llama_runner_error(self, model_name: str, message: str, output_buffer: list):
         """
         Slot to handle the LlamaCppRunner error signal.
         Displays an error message and updates UI status.
         """
         print(f"Llama Runner for {model_name} error: {message}")
-        # Show error message box
-        QMessageBox.critical(self, f"Llama Runner Error: {model_name}", f"Error: {message}")
+
+        # Create and show the custom error dialog
+        dialog_message = f"Llama.cpp server for {model_name} encountered an error:\n{message}"
+        error_dialog = ErrorOutputDialog(
+            title=f"Llama Runner Error: {model_name}",
+            message=dialog_message,
+            output_lines=output_buffer,
+            parent=self # Set parent to MainWindow
+        )
+        error_dialog.exec() # Show the dialog modally
 
         # Update UI status for this model
         if model_name in self.model_status_labels:
