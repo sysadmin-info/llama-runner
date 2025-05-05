@@ -8,82 +8,40 @@ To facilitate monitoring and control, we will implement a simple API using PySid
 
 ** API (PySide6)
 
-We will use PySide6 to create a simple API for monitoring and controlling the llama.cpp runner and LiteLLM proxy. This API will allow us to:
+We will use PySide6 to create a simple API for monitoring and controlling the llama.cpp runner and the FastAPI proxy. This API will allow us to:
 
 *   Start and stop the llama.cpp runner.
-*   Start and stop the LiteLLM proxy.
 *   View the status of the runner and proxy.
 *   Modify the configuration of the runner and proxy.
 
-** Server (LiteLLM Proxy)
+** Server (FastAPI Proxy)
 
-We will use Python and we will leverage LiteLLM to serve as the proxy. It is possible to run LiteLLM proxy programatically using the litellm import and Uvicorn:
+We will use Python and leverage FastAPI and Uvicorn to create the proxy server. We can run a FastAPI application programatically using Uvicorn:
 
 ```python
-from litellm.proxy.proxy_server import app
+from fastapi import FastAPI
 import uvicorn
 
+app = FastAPI()
+
+@app.get("/")
+async def read_root():
+    return {"Hello": "World"}
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=4000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 ```
 
-We can also dynamically construct the configuration needed and pass it to the Python code:
-main: server is listening on http://127.0.0.1:2345 - starting the main loop
-```python
-import os, tempfile, yaml
-from litellm.proxy.proxy_server import app
-import uvicorn
+We will add custom handlers to this FastAPI application to implement the desired proxying and dynamic runner management logic.
 
-# 1. Define your proxy config as a Python dict
-config = {
-    "model_list": [
-        {
-            "model_name": "gpt-3.5-turbo",
-            "litellm_params": {
-                "model": "openai/gpt-3.5-turbo",
-                "api_key": "os.environ/OPENAI_API_KEY"
-            }
-        }
-    ],
-    "general_settings": {
-        "master_key": "sk-xxx"
-    }
-}
-
-# 2. Dump to a temp YAML file
-with tempfile.NamedTemporaryFile(delete=False, suffix=".yaml") as f:
-    yaml.dump(config, f)
-    tmp_path = f.name
-
-# 3. Point LiteLLM at that file
-os.environ["CONFIG_FILE_PATH"] = tmp_path
-
-# 4. Start the proxy embedded via Uvicorn
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=4000, reload=True)
-```
-
-Custom handlers can be added by leveraging the Custom Handler option in the `config.yaml` and writing handler Python code like this:
-
-```python file=my_hook.py
-from litellm.proxy.call_hooks import before_request
-
-@before_request(path="/v1/chat/completions")
-def enforce_user_param(request):
-    if "user" not in request.json():
-        raise HTTPException(status_code=400, detail="Missing 'user'")
-```
-
-The detailed description of all `config.yaml` settings for LiteLLM is here: https://docs.litellm.ai/docs/proxy/config_settings
-
-The full documentation for LiteLLM in general is here: https://docs.litellm.ai/docs/
+The full documentation for FastAPI is here: https://fastapi.tiangolo.com/
 
 ** LMStudio backend support **
 
-By default, the LiteLLM proxy should run under port 1234. Moreover, it should emulate the following backends:
-*  /api/v0/chat/completions - redirect to /v1/chat/completions
-*  /api/v0/completions - redirect to /v1/completions
-*  /api/v0/embeddings - redirect to /v1/embeddings
+By default, the FastAPI proxy should run under port 1234. Moreover, it should emulate the following backends:
+*  /api/v0/chat/completions - proxy transparently to /v1/chat/completions
+*  /api/v0/completions - proxy transparently to /v1/completions
+*  /api/v0/embeddings - proxy transparently to /v1/embeddings
 *  /api/v0/models - a list of models in the following JSON format:
 
 ```
@@ -127,7 +85,7 @@ By default, the LiteLLM proxy should run under port 1234. Moreover, it should em
 }
 ```
 
-To obtain this information, our application should use the `gguf` python library to read metadata from the relevant model files defined in the config. The metadata should be cached - preferrably in a file stored locally in the ~/.llama-runner/ directory under the model's name and file hash plus locally in memory for the duration of the current run - to avoid reading gguf metadata (a costly operation) every time the models endpoint is queried.
+To obtain this information, our application should use the `gguf` python library to read metadata from the relevant model files defined in the config. The metadata should be cached - preferrably in a file stored locally in the ~/.llama-runner/ directory under the model's name and file size plus locally in memory for the duration of the current run - to avoid reading gguf metadata (a costly operation) every time the models endpoint is queried.
 
 *  /api/v0/models/{model}
 
@@ -263,7 +221,7 @@ Here is a dump from the --help option of llama-server listing all the options th
                                         vectors
 --control-vector-layer-range START END
                                         layer range to apply the control vector(s) to, start and end inclusive
--m,    --model FNAME                    model path (default: `models/$filename` with filename from `--hf-file`
+-m,   --model FNAME                    model path (default: `models/$filename` with filename from `--hf-file`
                                         or `--model-url` if set, otherwise models/7B/ggml-model-f16.gguf)
                                         (env: LLAMA_ARG_MODEL)
 -mu,   --model-url MODEL_URL            model download url (default: unused)
@@ -490,20 +448,6 @@ Here is a dump from the --help option of llama-server listing all the options th
                                         download weights from the internet)
 --fim-qwen-14b-spec                     use Qwen 2.5 Coder 14B + 0.5B draft for speculative decoding (note:
                                         can download weights from the internet)
-```
-
-Our runner should utilize a JSON configuration format that allows specifying any of those parameters (preferrably the name of the parameters should be the long forms of the options with "-" replaced by "_", so for example "cpu_mask" or "gpu_layers"). Besides those parameters, two main level parameters should be also used: the model display name and the full model file path.
-
-The runner should launch `llama.cpp` and wait for it to start accepting connections (which is indicated by the stdio message of `main: server is listening on http://127.0.0.1:2345 - starting the main loop` or similar). If a change of a model is needed, the `llama.cpp` process should be stopped, the launcher should wait 15 seconds for the model to quit before killing it off and starting any new llama.cpp instances.
-
-The JSON config for our map should allow for the definition of custom `llama.cpp` runtimes (with no configuration the `llama-server` available from PATH is assumed). For example:
-```json
-{
-    "llama-runtimes": {
-        "experimental": "/devel/tools/llama.cpp-experimental/build/bin/llama-server",
-        "ik_llama": "/devel/tools/ik_llama.cpp/build/bin/llama-server"
-    }
-}
 ```
 
 *** Development ***

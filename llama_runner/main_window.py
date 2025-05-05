@@ -18,7 +18,7 @@ except ImportError:
     logging.warning("The 'asyncio_qt' library is not installed. Asyncio-Qt bridging may not work correctly.")
     ASYNCIO_QT_AVAILABLE = False
 
-from litellm.proxy.proxy_server import app # Keep import for potential future direct interaction if needed
+# Removed: from litellm.proxy.proxy_server import app
 import uvicorn # Keep import if needed elsewhere, but proxy thread handles server
 
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -29,7 +29,8 @@ from PySide6.QtCore import QThread, QObject, Signal, Slot, Qt, QTimer # Import Q
 
 from llama_runner.config_loader import load_config
 from llama_runner.llama_cpp_runner import LlamaCppRunner
-from llama_runner.lite_llm_proxy_thread import LiteLLMProxyThread # Import the proxy thread from its new file
+# Updated import: Import FastAPIProxyThread
+from llama_runner.lite_llm_proxy_thread import FastAPIProxyThread # Import the proxy thread from its new file
 from llama_runner import gguf_metadata # Import the new metadata module
 
 # Configure logging
@@ -196,7 +197,7 @@ class LlamaRunnerThread(QThread):
             await self.runner.stop()
 
 
-# LiteLLMProxyThread is now in its own file: llama_runner.lite_llm_proxy_thread
+# FastAPIProxyThread is now in its own file: llama_runner.lite_llm_proxy_thread
 
 
 class ModelStatusWidget(QWidget):
@@ -259,7 +260,7 @@ class MainWindow(QWidget):
         self.llama_runtimes = self.config.get("llama-runtimes", {})
         self.default_runtime = "llama-server"
         self.models = self.config.get("models", {})
-        self.litellm_proxy_config = self.config.get("litellm-proxy", {})
+        # Removed: self.litellm_proxy_config = self.config.get("litellm-proxy", {}) # LiteLLM config removed
         # Get concurrent runners limit from config, default to 1 if not specified or invalid
         self.concurrent_runners_limit = self.config.get("concurrentRunners", 1)
         if not isinstance(self.concurrent_runners_limit, int) or self.concurrent_runners_limit < 1:
@@ -281,7 +282,8 @@ class MainWindow(QWidget):
 
 
         self.llama_runner_threads: Dict[str, LlamaRunnerThread] = {}  # Dictionary to store threads for each model
-        self.litellm_proxy_thread: Optional[LiteLLMProxyThread] = None
+        # Updated type hint for proxy thread
+        self.fastapi_proxy_thread: Optional[FastAPIProxyThread] = None
 
         # Dictionary to hold asyncio Futures for runners that are starting
         # Key: model_name, Value: asyncio.Future
@@ -338,21 +340,21 @@ class MainWindow(QWidget):
         self.llama_tab.setLayout(self.llama_layout)
         self.tabs.addTab(self.llama_tab, "Llama Runner")
 
-        # LiteLLM Proxy Tab
-        self.litellm_tab = QWidget()
-        self.litellm_layout = QVBoxLayout()
-        self.litellm_layout.addWidget(QLabel("LiteLLM Proxy Status:"))
-        self.litellm_status_label = QLabel("Not Running")
-        self.litellm_layout.addWidget(self.litellm_status_label)
+        # LiteLLM Proxy Tab (Updated label)
+        self.fastapi_proxy_tab = QWidget()
+        self.fastapi_proxy_layout = QVBoxLayout()
+        self.fastapi_proxy_layout.addWidget(QLabel("FastAPI Proxy Status:")) # Updated label
+        self.fastapi_proxy_status_label = QLabel("Not Running") # Updated variable name
+        self.fastapi_proxy_layout.addWidget(self.fastapi_proxy_status_label) # Updated variable name
         # Remove start/stop buttons for proxy, it starts automatically
         # self.litellm_start_button = QPushButton("Start LiteLLM Proxy")
         # self.litellm_stop_button = QPushButton("Stop LiteLLM Proxy")
         # self.litellm_stop_button.setEnabled(False) # Initially disabled
         # self.litellm_layout.addWidget(self.litellm_start_button)
         # self.litellm_layout.addWidget(self.litellm_stop_button)
-        self.litellm_layout.addStretch()
-        self.litellm_tab.setLayout(self.litellm_layout)
-        self.tabs.addTab(self.litellm_tab, "LiteLLM Proxy")
+        self.fastapi_proxy_layout.addStretch()
+        self.fastapi_proxy_tab.setLayout(self.fastapi_proxy_layout)
+        self.tabs.addTab(self.fastapi_proxy_tab, "FastAPI Proxy") # Updated tab title
 
         self.layout.addWidget(self.tabs)
         self.setLayout(self.layout)
@@ -364,8 +366,8 @@ class MainWindow(QWidget):
         # Connect signals from LlamaRunnerThreads (will be connected when threads are created)
         # We need to connect these signals dynamically when a thread is started.
 
-        # --- Start the LiteLLM Proxy automatically ---
-        self.start_litellm_proxy()
+        # --- Start the FastAPI Proxy automatically ---
+        self.start_fastapi_proxy() # Updated method call
         # --- End automatic proxy start ---
 
 
@@ -375,7 +377,7 @@ class MainWindow(QWidget):
         """
         print("MainWindow closing. Stopping all runners and proxy...")
         self.stop_all_llama_runners()
-        self.stop_litellm_proxy()
+        self.stop_fastapi_proxy() # Updated method call
 
         # Give threads a moment to stop gracefully
         # A more robust shutdown might involve waiting for threads to finish
@@ -596,63 +598,73 @@ class MainWindow(QWidget):
             # time.sleep(0.1) # Optional: brief pause
 
 
-    def start_litellm_proxy(self):
+    def start_fastapi_proxy(self): # Updated method name
         """
-        Starts the LiteLLM proxy in a separate thread.
+        Starts the FastAPI proxy in a separate thread.
         This is now called automatically in __init__.
         """
-        if self.litellm_proxy_thread is not None and self.litellm_proxy_thread.isRunning():
-            print("LiteLLM Proxy is already running.")
+        # Updated variable name
+        if self.fastapi_proxy_thread is not None and self.fastapi_proxy_thread.isRunning():
+            print("FastAPI Proxy is already running.") # Updated print
             return
 
-        print("Starting LiteLLM Proxy...")
-        self.litellm_status_label.setText("Running...")
+        print("Starting FastAPI Proxy...") # Updated print
+        # Updated status label variable name
+        self.fastapi_proxy_status_label.setText("Running...")
         # Proxy buttons are removed, status label is enough
 
-        proxy_api_key = self.litellm_proxy_config.get("api_key")
+        # Removed: proxy_api_key = self.litellm_proxy_config.get("api_key") # LiteLLM config removed
 
         # Pass models config and the necessary callback methods to the proxy thread
-        self.litellm_proxy_thread = LiteLLMProxyThread(
+        # Updated class name
+        self.fastapi_proxy_thread = FastAPIProxyThread(
             models_config=self.models,
             is_model_running_callback=self.is_llama_runner_running, # Pass the callback method
             get_runner_port_callback=self.get_runner_port, # Pass the callback method
             request_runner_start_callback=self.request_runner_start, # Pass the callback method
-            api_key=proxy_api_key,
-            # active_model_name and active_model_port are no longer passed here
+            # api_key is no longer passed if not used by our FastAPI app
+            # api_key=proxy_api_key,
         )
         # Connect signals from the proxy thread if needed (e.g., started, stopped, error)
-        # self.litellm_proxy_thread.started.connect(self.on_litellm_proxy_started)
-        # self.litellm_proxy_thread.stopped.connect(self.on_litellm_proxy_stopped)
-        # self.litellm_proxy_thread.error.connect(self.on_litellm_proxy_error)
+        # self.fastapi_proxy_thread.started.connect(self.on_fastapi_proxy_started)
+        # self.fastapi_proxy_thread.stopped.connect(self.on_fastapi_proxy_stopped)
+        # self.fastapi_proxy_thread.error.connect(self.on_fastapi_proxy_error)
 
         # Connect MainWindow signals to proxy thread slots for bridging
-        self.runner_port_ready_for_proxy.connect(self.litellm_proxy_thread.on_runner_port_ready)
-        self.runner_stopped_for_proxy.connect(self.litellm_proxy_thread.on_runner_stopped)
+        # Updated variable name
+        self.runner_port_ready_for_proxy.connect(self.fastapi_proxy_thread.on_runner_port_ready)
+        self.runner_stopped_for_proxy.connect(self.fastapi_proxy_thread.on_runner_stopped)
 
 
-        self.litellm_proxy_thread.start()
+        # Updated variable name
+        self.fastapi_proxy_thread.start()
 
 
-    def stop_litellm_proxy(self):
+    def stop_fastapi_proxy(self): # Updated method name
         """
-        Stops the LiteLLM proxy thread.
+        Stops the FastAPI proxy thread.
         This is now called automatically on closeEvent.
         """
-        if self.litellm_proxy_thread and self.litellm_proxy_thread.isRunning():
-            print("Stopping LiteLLM Proxy...")
-            self.litellm_status_label.setText("Stopping...")
+        # Updated variable name
+        if self.fastapi_proxy_thread and self.fastapi_proxy_thread.isRunning():
+            print("Stopping FastAPI Proxy...") # Updated print
+            # Updated status label variable name
+            self.fastapi_proxy_status_label.setText("Stopping...")
             # Proxy buttons are removed
 
-            self.litellm_proxy_thread.stop()
+            # Updated variable name
+            self.fastapi_proxy_thread.stop()
             # Don't wait() here in the UI thread
             # The thread will eventually finish and the status will update (manually for now)
             # A signal from the proxy thread would be better here.
             # For now, manually update status after signaling stop
-            self.litellm_status_label.setText("Not Running")
+            # Updated status label variable name
+            self.fastapi_proxy_status_label.setText("Not Running")
 
         else:
-            print("LiteLLM Proxy is not running.")
-            self.litellm_status_label.setText("Not Running")
+            print("FastAPI Proxy is not running.") # Updated print
+            # Updated status label variable name
+            self.fastapi_proxy_status_label.setText("Not Running")
 
 
     @Slot(str)
@@ -762,25 +774,25 @@ class MainWindow(QWidget):
 
     # Optional: Slots for proxy thread signals if added later
     # @Slot()
-    # def on_litellm_proxy_started(self):
-    #     print("LiteLLM Proxy started.")
-    #     self.litellm_status_label.setText("Running")
-    #     self.litellm_start_button.setEnabled(False)
-    #     self.litellm_stop_button.setEnabled(True)
+    # def on_fastapi_proxy_started(self): # Updated method name
+    #     print("FastAPI Proxy started.") # Updated print
+    #     self.fastapi_proxy_status_label.setText("Running") # Updated variable name
+    #     # self.litellm_start_button.setEnabled(False) # Removed button
+    #     # self.litellm_stop_button.setEnabled(True) # Removed button
 
     # @Slot()
-    # def on_litellm_proxy_stopped(self):
-    #     print("LiteLLM Proxy stopped.")
-    #     self.litellm_status_label.setText("Not Running")
-    #     self.litellm_start_button.setEnabled(True)
-    #     self.litellm_stop_button.setEnabled(False)
+    # def on_fastapi_proxy_stopped(self): # Updated method name
+    #     print("FastAPI Proxy stopped.") # Updated print
+    #     self.fastapi_proxy_status_label.setText("Not Running") # Updated variable name
+    #     # self.litellm_start_button.setEnabled(True) # Removed button
+    #     # self.litellm_stop_button.setEnabled(False) # Removed button
 
     # @Slot(str)
-    # def on_litellm_proxy_error(self, message: str):
-    #     print(f"LiteLLM Proxy error: {message}")
-    #     self.litellm_status_label.setText(f"Error: {message}")
-    #     self.litellm_start_button.setEnabled(True)
-    #     self.litellm_stop_button.setEnabled(False)
+    # def on_fastapi_proxy_error(self, message: str): # Updated method name
+    #     print(f"FastAPI Proxy error: {message}") # Updated print
+    #     self.fastapi_proxy_status_label.setText(f"Error: {message}") # Updated variable name
+    #     # self.litellm_start_button.setEnabled(True) # Removed button
+    #     # self.litellm_stop_button.setEnabled(False) # Removed button
 
 
 # The main function is now in main.py

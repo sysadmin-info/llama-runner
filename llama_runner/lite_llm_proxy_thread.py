@@ -2,18 +2,17 @@ import sys
 import asyncio
 import subprocess
 import os
-import tempfile
-import yaml
+import tempfile # Keep tempfile for potential future use, but config file logic removed
+import yaml # Keep yaml for potential future use, but config file logic removed
 import logging
 import traceback
 import time
-import json # Import the json module
+import json
 from typing import Dict, Any, Callable, List, Optional
 
-from litellm.proxy.proxy_server import app # Import the global FastAPI app instance
-import uvicorn
-from fastapi import HTTPException, Request, Response, status
-from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse # Import RedirectResponse
+# Removed: from litellm.proxy.proxy_server import app
+from fastapi import FastAPI, HTTPException, Request, Response, status # Import FastAPI and necessary components
+from fastapi.responses import JSONResponse, StreamingResponse # RedirectResponse is not needed if we proxy
 import httpx # Import httpx for forwarding requests
 
 from PySide6.QtCore import QThread, QObject, Signal, Slot, QTimer # Import QTimer for potential use
@@ -23,7 +22,13 @@ from llama_runner import gguf_metadata # Import the new metadata module
 # Configure logging (already done in main.py for configurable levels)
 # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# --- Create our own FastAPI app instance ---
+app = FastAPI()
+# --- End create app instance ---
+
+
 # Define standalone handlers that access state via app.state
+@app.get("/api/v0/models")
 async def _get_lmstudio_models_handler(request: Request):
     """Handler for GET /api/v0/models"""
     # Access state from the request's app instance
@@ -45,7 +50,7 @@ async def _get_lmstudio_models_handler(request: Request):
         logging.error(f"Error handling /api/v0/models: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal Server Error retrieving models metadata")
 
-
+@app.get("/api/v0/models/{model_id}")
 async def _get_lmstudio_model_handler(model_id: str, request: Request):
     """Handler for GET /api/v0/models/{model_id}"""
     # Access state from the request's app instance
@@ -83,7 +88,7 @@ async def _dynamic_route_v1_request(request: Request):
     get_runner_port_callback = request.app.state.get_runner_port_callback
     request_runner_start_callback = request.app.state.request_runner_start_callback
     # Access the proxy thread instance to get the futures dictionary
-    proxy_thread: LiteLLMProxyThread = request.app.state.proxy_thread_instance # We'll set this in run_async
+    proxy_thread: FastAPIProxyThread = request.app.state.proxy_thread_instance # We'll set this in run_async
 
     # Extract the model name from the request body (common for chat/completions)
     # This is a simplification; a more robust solution would inspect the path and body structure
@@ -236,6 +241,7 @@ async def _dynamic_route_v1_request(request: Request):
 
 # --- Handlers for /api/v0/* proxying ---
 # These handlers will call the _dynamic_route_v1_request handler internally
+@app.post("/api/v0/chat/completions")
 async def _proxy_v0_chat_completions(request: Request):
     """Proxies /api/v0/chat/completions to /v1/chat/completions."""
     logging.debug("Proxying /api/v0/chat/completions to /v1/chat/completions")
@@ -263,7 +269,7 @@ async def _proxy_v0_chat_completions(request: Request):
         # Restore the original path
         request.scope['path'] = original_path
 
-
+@app.post("/api/v0/completions")
 async def _proxy_v0_completions(request: Request):
     """Proxies /api/v0/completions to /v1/completions."""
     logging.debug("Proxying /api/v0/completions to /v1/completions")
@@ -275,7 +281,7 @@ async def _proxy_v0_completions(request: Request):
     finally:
         request.scope['path'] = original_path
 
-
+@app.post("/api/v0/embeddings")
 async def _proxy_v0_embeddings(request: Request):
     """Proxies /api/v0/embeddings to /v1/embeddings."""
     logging.debug("Proxying /api/v0/embeddings to /v1/embeddings")
@@ -288,33 +294,6 @@ async def _proxy_v0_embeddings(request: Request):
         request.scope['path'] = original_path
 
 # --- End handlers for /api/v0/* proxying ---
-
-
-# Add LM Studio compatible routes to the global FastAPI app instance
-# Check if routes already exist to avoid adding them multiple times
-# This is a simple check and might not be robust against all changes
-existing_routes = [route.path for route in app.routes]
-if "/api/v0/models" not in existing_routes:
-     logging.info("Adding LM Studio compatible API routes.")
-     app.add_api_route("/api/v0/models", _get_lmstudio_models_handler, methods=["GET"])
-     app.add_api_route("/api/v0/models/{model_id}", _get_lmstudio_model_handler, methods=["GET"])
-else:
-     logging.info("LM Studio compatible API routes already exist.")
-
-# --- Add proxy routes for /api/v0/* endpoints ---
-# These replace the previous redirect routes.
-# Add these *before* the /v1/* dynamic routing handlers if possible,
-# although the paths are distinct so order shouldn't strictly matter here.
-if "/api/v0/chat/completions" not in existing_routes:
-    app.add_api_route("/api/v0/chat/completions", _proxy_v0_chat_completions, methods=["POST"])
-    logging.info("Added proxy handler for /api/v0/chat/completions.")
-if "/api/v0/completions" not in existing_routes:
-    app.add_api_route("/api/v0/completions", _proxy_v0_completions, methods=["POST"])
-    logging.info("Added proxy handler for /api/v0/completions.")
-if "/api/v0/embeddings" not in existing_routes:
-    app.add_api_route("/api/v0/embeddings", _proxy_v0_embeddings, methods=["POST"])
-    logging.info("Added proxy handler for /api/v0/embeddings.")
-# --- End add proxy routes ---
 
 
 # --- Add routes for /v1/* endpoints to be intercepted ---
@@ -330,13 +309,12 @@ if "/api/v0/embeddings" not in existing_routes:
 # For simplicity, let's assume adding them here works.
 
 # Check if specific /v1 routes exist before adding our dynamic handler
-v1_routes_to_intercept = ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"]
-our_v1_routes_added = False
+# This check is complex because LiteLLM might add routes like /v1/chat/completions directly.
+# A simpler approach is to add our catch-all /v1/{path:path} route and ensure it's processed first.
+# FastAPI processes routes in the order they are added.
 
-# Check if any of the target /v1 paths are already in app.routes
-# This check is imperfect as LiteLLM might add them later or differently.
-# A more robust solution might involve removing LiteLLM's handlers or using middleware.
-# For now, let's add our handlers and assume they take precedence if added after LiteLLM's import.
+# Let's add specific routes for the common endpoints first, then a catch-all if needed.
+# This is safer than a broad catch-all if LiteLLM adds other /v1 routes we don't want to intercept.
 
 # Add specific routes for common /v1 endpoints
 # The handler will extract the model name from the request body
@@ -347,36 +325,35 @@ dynamic_v1_paths = ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"]
 # This is a more robust check than just checking the path string
 current_v1_handlers = {route.path: route.endpoint for route in app.routes if route.path in dynamic_v1_paths}
 
-if current_v1_handlers.get("/v1/chat/completions") != _dynamic_route_v1_request:
-    app.add_api_route("/v1/chat/completions", _dynamic_route_v1_request, methods=["POST"])
-    logging.info("Added dynamic routing handler for /v1/chat/completions.")
-    our_v1_routes_added = True
+# Add routes using the @app.post decorator
+@app.post("/v1/chat/completions")
+async def _v1_chat_completions_handler(request: Request):
+    return await _dynamic_route_v1_request(request)
 
-if current_v1_handlers.get("/v1/completions") != _dynamic_route_v1_request:
-    app.add_api_route("/v1/completions", _dynamic_route_v1_request, methods=["POST"]) # Completions is usually POST
-    logging.info("Added dynamic routing handler for /v1/completions.")
-    our_v1_routes_added = True
+@app.post("/v1/completions")
+async def _v1_completions_handler(request: Request):
+    return await _dynamic_route_v1_request(request)
 
-if current_v1_handlers.get("/v1/embeddings") != _dynamic_route_v1_request:
-    app.add_api_route("/v1/embeddings", _dynamic_route_v1_request, methods=["POST"]) # Embeddings is usually POST
-    logging.info("Added dynamic routing handler for /v1/embeddings.")
-    our_v1_routes_added = True
+@app.post("/v1/embeddings")
+async def _v1_embeddings_handler(request: Request):
+    return await _dynamic_route_v1_request(request)
 
-if not our_v1_routes_added:
-     logging.info("Dynamic routing handlers for /v1/* already exist.")
+logging.info("Added dynamic routing handlers for /v1/chat/completions, /v1/completions, /v1/embeddings.")
 
 
 # If needed, add a catch-all for other /v1 paths, but be cautious
-# app.add_api_route("/v1/{path:path}", _dynamic_route_v1_request, methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+# @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+# async def _v1_catch_all_handler(request: Request):
+#     return await _dynamic_route_v1_request(request)
 # logging.info("Added catch-all dynamic routing handler for /v1/*.")
 
 
 # --- End add routes ---
 
 
-class LiteLLMProxyThread(QThread):
+class FastAPIProxyThread(QThread): # Renamed class
     """
-    QThread to run the LiteLLM proxy in a separate thread.
+    QThread to run the FastAPI proxy in a separate thread. # Updated description
     Handles LM Studio API emulation and runner management requests.
     """
     # Define signals if needed (e.g., started, stopped, error)
@@ -398,7 +375,7 @@ class LiteLLMProxyThread(QThread):
         self.api_key = api_key
         self.is_running = False
         self._uvicorn_server = None
-        self._temp_config_path = None
+        # self._temp_config_path = None # No longer needed
 
         # Dictionary to hold asyncio Futures for runners that are starting
         # This dictionary is managed by MainWindow, but the proxy thread needs
@@ -447,7 +424,7 @@ class LiteLLMProxyThread(QThread):
 
     def run(self):
         """
-        Runs the LiteLLM proxy in the thread.
+        Runs the FastAPI proxy in the thread using Uvicorn.
         """
         self.is_running = True
         try:
@@ -461,17 +438,17 @@ class LiteLLMProxyThread(QThread):
 
             self.loop.run_until_complete(self.run_async())
         except Exception as e:
-            logging.error(f"Unexpected error in LiteLLMProxyThread run: {e}\n{traceback.format_exc()}")
+            logging.error(f"Unexpected error in FastAPIProxyThread run: {e}\n{traceback.format_exc()}")
         finally:
             self.is_running = False
-            # Clean up the temporary config file
-            if self._temp_config_path and os.path.exists(self._temp_config_path):
-                 try:
-                     os.unlink(self._temp_config_path)
-                     logging.info(f"Cleaned up temporary LiteLLM config file: {self._temp_config_path}")
-                 except OSError as e:
-                     logging.error(f"Error cleaning up temporary LiteLLM config file {self._temp_config_path}: {e}")
-            self._temp_config_path = None # Clear the path
+            # Clean up the temporary config file (no longer generated)
+            # if self._temp_config_path and os.path.exists(self._temp_config_path):
+            #      try:
+            #          os.unlink(self._temp_config_path)
+            #          logging.info(f"Cleaned up temporary LiteLLM config file: {self._temp_config_path}")
+            #      except OSError as e:
+            #          logging.error(f"Error cleaning up temporary LiteLLM config file {self._temp_config_path}: {e}")
+            # self._temp_config_path = None # Clear the path
 
             # --- Clean up the proxy thread instance from app state ---
             if hasattr(app.state, 'proxy_thread_instance'):
@@ -487,43 +464,13 @@ class LiteLLMProxyThread(QThread):
     async def run_async(self):
         """
         Asynchronous part of the proxy runner.
-        Configures LiteLLM with all models and starts the Uvicorn server.
+        Starts the Uvicorn server for the FastAPI app.
         """
-        print("Starting LiteLLM Proxy...")
+        print("Starting FastAPI Proxy...")
         try:
-            # 1. Define your proxy config as a Python dict
-            # Configure LiteLLM's model_list with ALL configured models.
-            # The api_base will be a placeholder. The dynamic routing handler intercepts
-            # requests *before* LiteLLM's internal routing uses this config.
-            proxy_config = {
-                "model_list": [],
-                "general_settings": {
-                    "master_key": self.api_key if self.api_key else None
-                }
-            }
-
-            # Add all configured models to the LiteLLM model_list
-            for model_name in self.models_config.keys():
-                 # Use a dummy api_base. The dynamic routing handler will bypass this.
-                 proxy_config["model_list"].append({
-                     "model_name": model_name,
-                     "litellm_params": {
-                         "model": f"openai/{model_name}", # Use openai provider pointing to llama.cpp
-                         "api_base": "http://127.0.0.1:1", # Dummy port
-                         "api_key": "sk-dummy" # Dummy key required by LiteLLM for openai provider
-                     }
-                 })
-            logging.info(f"LiteLLM Proxy configured with {len(proxy_config['model_list'])} models in model_list (using dummy ports).")
-
-
-            # 2. Dump to a temp YAML file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".yaml", mode='w') as f:
-                yaml.dump(proxy_config, f)
-                self._temp_config_path = f.name # Store path for cleanup
-            logging.info(f"LiteLLM proxy config written to {self._temp_config_path}")
-
-            # 3. Point LiteLLM at that file
-            os.environ["CONFIG_FILE_PATH"] = self._temp_config_path
+            # LiteLLM config generation removed.
+            # The FastAPI app 'app' is already created at the module level.
+            # Routes are added at the module level.
 
             # 4. Start the proxy embedded via Uvicorn
             # Set state on the global app instance BEFORE creating the server
@@ -538,27 +485,27 @@ class LiteLLMProxyThread(QThread):
             uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=1234, reload=False)
             self._uvicorn_server = uvicorn.Server(uvicorn_config)
 
-            print("LiteLLM Proxy listening on http://0.0.0.0:1234")
-            logging.info("LiteLLM Proxy listening on http://0.0.0.0:1234")
+            print("FastAPI Proxy listening on http://0.0.0.0:1234")
+            logging.info("FastAPI Proxy listening on http://0.0.0.0:1234")
 
 
             # This call is blocking until the server stops
             await self._uvicorn_server.serve()
 
         except Exception as e:
-            print(f"Error starting LiteLLM Proxy: {e}")
-            logging.error(f"Error starting LiteLLM Proxy: {e}\n{traceback.format_exc()}")
+            print(f"Error starting FastAPI Proxy: {e}")
+            logging.error(f"Error starting FastAPI Proxy: {e}\n{traceback.format_exc()}")
             # Emit error signal if needed
             # self.error.emit(str(e))
         finally:
             # Cleanup happens in run()'s finally block now
-            print("LiteLLM Proxy stopped.")
-            logging.info("LiteLLM Proxy stopped.")
+            print("FastAPI Proxy stopped.")
+            logging.info("FastAPI Proxy stopped.")
 
 
     def stop(self):
         """
-        Signals the LiteLLM proxy thread to stop.
+        Signals the FastAPI proxy thread to stop.
         """
         self.is_running = False
         if self._uvicorn_server:

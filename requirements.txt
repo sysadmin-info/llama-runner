@@ -1,7 +1,7 @@
 PySide6
-litellm[proxy]
 uvicorn
 pyyaml
 gguf
 httpx
 qasync
+fastapi # Explicitly add fastapi
