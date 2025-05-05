@@ -130,17 +130,10 @@ async def main():
     llama_runtimes = config.get("llama-runtimes", {})
     default_runtime = "llama-server"  # Default to llama-server from PATH
 
-    # Example usage with a dummy model
-    model_name = "test-model"
-    model_path = os.path.join(CONFIG_DIR, "test-model.gguf")  # Dummy model path
-
-    # Create a dummy model file if it doesn't exist
-    if not os.path.exists(model_path):
-        with open(model_path, "w") as f:
-            f.write("This is a dummy model file.")
-
     # Load model-specific config, if available
+    model_name = "test-model" # hardcoded for now
     model_config = config.get("models", {}).get(model_name, {})
+    model_path = model_config.get("model_path")
     llama_cpp_runtime = llama_runtimes.get(model_config.get("llama_cpp_runtime", "default"), default_runtime)
 
     runner = LlamaCppRunner(

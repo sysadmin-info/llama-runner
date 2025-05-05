@@ -1,0 +1,24 @@
+{
+  "llama-runtimes": {
+    "default": "llama-server",
+    "experimental": "/opt/llama.cpp-experimental/llama-server"
+  },
+  "models": {
+    "test-model": {
+      "model_path": "/models/test-model.gguf",
+      "llama_cpp_runtime": "default",
+      "parameters": {
+        "ctx_size": 2048,
+        "gpu_layers": 32
+      }
+    },
+    "another-model": {
+      "model_path": "/models/another-model.gguf",
+      "llama_cpp_runtime": "experimental",
+      "parameters": {
+        "ctx_size": 4096,
+        "threads": 8
+      }
+    }
+  }
+}
