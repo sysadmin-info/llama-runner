@@ -349,9 +349,8 @@ class MainWindow(QWidget):
             self.model_status_labels[model_name].setText("Error")
             self.model_buttons[model_name].setEnabled(True)
             self.model_port_labels[model_name].setText("Port: N/A")
-        finally:
-            if model_name in self.llama_runner_threads:
-                self.llama_runner_threads.pop(model_name, None)
+        if model_name in self.llama_runner_threads:
+            self.llama_runner_threads.pop(model_name, None)
         else:
             QMessageBox.critical(self, "Llama Runner Error", f"Llama Runner Error: {message}")
 
