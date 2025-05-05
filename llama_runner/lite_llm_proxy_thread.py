@@ -7,6 +7,7 @@ import yaml
 import logging
 import traceback
 import time
+import json # Import the json module
 from typing import Dict, Any, Callable, List, Optional
 
 from litellm.proxy.proxy_server import app # Import the global FastAPI app instance
