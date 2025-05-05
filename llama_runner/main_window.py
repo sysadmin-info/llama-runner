@@ -11,7 +11,7 @@ import uvicorn
 
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel,
                                QPushButton, QLineEdit, QTabWidget)
-from PySide6.QtCore import QThread, QObject, pyqtSignal, Slot
+from PySide6.QtCore import QThread, QObject, Signal, Slot
 
 from llama_runner.config_loader import load_config
 from llama_runner.llama_cpp_runner import LlamaCppRunner
@@ -23,10 +23,10 @@ class LlamaRunnerThread(QThread):
     """
     QThread to run the LlamaCppRunner in a separate thread to avoid blocking the UI.
     """
-    started = pyqtSignal()
-    stopped = pyqtSignal()
-    error = pyqtSignal(str)
-    port_ready = pyqtSignal(int)
+    started = Signal()
+    stopped = Signal()
+    error = Signal(str)
+    port_ready = Signal(int)
 
     def __init__(self, model_name: str, model_path: str, llama_cpp_runtime: str = None, **kwargs):
         super().__init__()
