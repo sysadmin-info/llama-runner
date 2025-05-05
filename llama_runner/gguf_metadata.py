@@ -17,10 +17,11 @@ except ImportError:
 # Attempt to import the gguf library and specific components
 try:
     from gguf import GGUFReader
-    from gguf.gguf_reader import GGMLQuantizationType # Import the quantization enum
+    # Corrected import: Use LlamaFileType instead of GGMLQuantizationType
+    from gguf.gguf_reader import LlamaFileType # Import the correct enum
     GGUF_AVAILABLE = True
 except ImportError:
-    logging.warning("The 'gguf' library is not installed or GGMLQuantizationType is missing. Metadata extraction will be disabled.")
+    logging.warning("The 'gguf' library is not installed or LlamaFileType is missing. Metadata extraction will be disabled.")
     GGUF_AVAILABLE = False
 except Exception as e:
     logging.warning(f"Error importing gguf components: {e}. Metadata extraction may be limited.")
@@ -208,7 +209,7 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         # compatibility_type: "gguf" (static)
         compatibility_type = "gguf" # Static value
 
-        # quantization: GGMLQuantizationType(general.file_type).name (fallback to heuristic)
+        # quantization: LlamaFileType(general.file_type).name (fallback to heuristic)
         quantization = "Unknown"
         file_type_val = get_scalar_metadata('general.file_type') # Use the helper to get the raw value
 
@@ -228,15 +229,15 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                     file_type_int = None # Fall through to heuristic
 
                 if file_type_int is not None:
-                    # Use the integer value to get the enum name
-                    quantization = GGMLQuantizationType(file_type_int).name
+                    # Use the integer value to get the enum name from LlamaFileType
+                    quantization = LlamaFileType(file_type_int).name
                 # else: fall through to heuristic
 
             except ValueError:
-                logging.warning(f"Unknown GGMLQuantizationType integer value: {file_type_val} for {model_path}")
+                logging.warning(f"Unknown LlamaFileType integer value: {file_type_val} for {model_path}")
                 quantization = f"Type_{file_type_val}" # Fallback if enum value is unknown
             except Exception as e:
-                 logging.warning(f"Error getting quantization name from enum for {model_path}: {e}")
+                 logging.warning(f"Error getting quantization name from LlamaFileType enum for {model_path}: {e}")
                  # Fall through to heuristic
         # Fallback to heuristic if enum method fails or is not available
         if quantization == "Unknown":
