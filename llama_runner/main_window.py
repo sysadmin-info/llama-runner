@@ -223,60 +223,79 @@ class MainWindow(QWidget):
         self.setLayout(self.layout)
 
         # Connect buttons to actions
-        self.llama_start_button.clicked.connect(self.start_llama_runner)
-        self.llama_stop_button.clicked.connect(self.stop_llama_runner)
+        # self.llama_start_button.clicked.connect(self.start_llama_runner) # REMOVE
+        # self.llama_stop_button.clicked.connect(self.stop_llama_runner) # REMOVE
         self.litellm_start_button.clicked.connect(self.start_litellm_proxy)
         self.litellm_stop_button.clicked.connect(self.stop_litellm_proxy)
 
-    def start_llama_runner(self):
+    def start_llama_runner(self, model_name: str):
         """
-        Starts the LlamaCppRunner in a separate thread.
+        Starts the LlamaCppRunner for a specific model in a separate thread.
         """
-        if self.llama_runner_thread is None or not self.llama_runner_thread.isRunning():
-            self.llama_runner_thread = LlamaRunnerThread(
-                model_name=self.model_name,
-                model_path=self.model_path,
-                llama_cpp_runtime=self.llama_cpp_runtime,
-                **self.model_config.get("parameters", {})
-            )
-            self.llama_runner_thread.started.connect(self.on_llama_runner_started)
-            self.llama_runner_thread.stopped.connect(self.on_llama_runner_stopped)
-            self.llama_runner_thread.error.connect(self.on_llama_runner_error)
-            self.llama_runner_thread.port_ready.connect(self.on_llama_runner_port_ready)
-            self.llama_runner_thread.start()
-            self.llama_status_label.setText("Starting...")
-            self.llama_start_button.setEnabled(False)
-            self.llama_stop_button.setEnabled(True)
-        else:
-            print("Llama Runner is already running.")
+        if model_name not in self.models:
+            print(f"Model {model_name} not found in config.")
+            return
 
-    def stop_llama_runner(self):
-        """
-        Stops the LlamaCppRunner thread.
-        """
-        if self.llama_runner_thread and self.llama_runner_thread.isRunning():
-            self.llama_runner_thread.stop()
-            self.llama_runner_thread.wait()  # Wait for the thread to finish
-            self.llama_status_label.setText("Stopping...")
-            self.llama_start_button.setEnabled(True)
-            self.llama_stop_button.setEnabled(False)
+        model_config = self.models[model_name]
+        model_path = model_config.get("model_path")
+        llama_cpp_runtime = self.llama_runtimes.get(model_config.get("llama_cpp_runtime", "default"), self.default_runtime)
+
+        if model_name not in self.llama_runner_threads or not self.llama_runner_threads[model_name].isRunning():
+            self.llama_runner_threads[model_name] = LlamaRunnerThread(
+                model_name=model_name,
+                model_path=model_path,
+                llama_cpp_runtime=llama_cpp_runtime,
+                **model_config.get("parameters", {})
+            )
+            self.llama_runner_threads[model_name].started.connect(self.on_llama_runner_started)
+            self.llama_runner_threads[model_name].stopped.connect(self.on_llama_runner_stopped)
+            self.llama_runner_threads[model_name].error.connect(self.on_llama_runner_error)
+            self.llama_runner_threads[model_name].port_ready.connect(lambda port, name=model_name: self.on_llama_runner_port_ready(name, port))
+            self.llama_runner_threads[model_name].start()
+
+            self.model_status_labels[model_name].setText("Starting...")
+            self.model_buttons[model_name].setEnabled(False)
         else:
-            print("Llama Runner is not running.")
+            print(f"Llama Runner for {model_name} is already running.")
+
+    def stop_llama_runner(self, model_name: str):
+        """
+        Stops the LlamaCppRunner thread for a specific model.
+        """
+        if model_name in self.llama_runner_threads and self.llama_runner_threads[model_name].isRunning():
+            self.llama_runner_threads[model_name].stop()
+            self.llama_runner_threads[model_name].wait()  # Wait for the thread to finish
+
+            self.model_status_labels[model_name].setText("Not Running")
+            self.model_buttons[model_name].setEnabled(True)
+            self.model_port_labels[model_name].setText("Port: N/A")
+        else:
+            print(f"Llama Runner for {model_name} is not running.")
+
+    def stop_all_llama_runners(self):
+        """
+        Stops all LlamaCppRunner threads.
+        """
+        for model_name in list(self.llama_runner_threads.keys()):  # Iterate over a copy of the keys
+            self.stop_llama_runner(model_name)
 
     def start_litellm_proxy(self):
         """
         Starts the LiteLLM proxy in a separate thread.
         """
-        if self.llama_runner_thread is None or not self.llama_runner_thread.isRunning():
-            print("Llama Runner must be started first.")
-            return
+        # Find the first running Llama Runner to connect to
+        running_model_name = None
+        for model_name, thread in self.llama_runner_threads.items():
+            if thread.isRunning() and thread.runner is not None:
+                running_model_name = model_name
+                break
 
-        if self.llama_runner_thread.runner is None:
-            print("Llama Runner is still initializing.")
+        if not running_model_name:
+            print("No Llama Runner is running. Start one first.")
             return
 
         if self.litellm_proxy_thread is None or not self.litellm_proxy_thread.isRunning():
-            self.litellm_proxy_thread = LiteLLMProxyThread(model_name=self.model_name, llama_cpp_port=self.llama_runner_thread.runner.get_port())
+            self.litellm_proxy_thread = LiteLLMProxyThread(model_name=running_model_name, llama_cpp_port=self.llama_runner_threads[running_model_name].runner.get_port())
             self.litellm_proxy_thread.start()
             self.litellm_status_label.setText("Running...")
         else:
@@ -298,35 +317,32 @@ class MainWindow(QWidget):
         """
         Slot to handle the LlamaCppRunner started signal.
         """
-        self.llama_status_label.setText("Running")
-        self.llama_start_button.setEnabled(False)
-        self.llama_stop_button.setEnabled(True)
+        # This slot is not used anymore, as the status is updated per model
+        pass
 
     @Slot()
     def on_llama_runner_stopped(self):
         """
         Slot to handle the LlamaCppRunner stopped signal.
         """
-        self.llama_status_label.setText("Not Running")
-        self.llama_start_button.setEnabled(True)
-        self.llama_stop_button.setEnabled(False)
-        self.llama_port_label.setText("Port: N/A")
+        # This slot is not used anymore, as the status is updated per model
+        pass
 
     @Slot(str)
     def on_llama_runner_error(self, message):
         """
         Slot to handle the LlamaCppRunner error signal.
         """
-        self.llama_status_label.setText(f"Error: {message}")
-        self.llama_start_button.setEnabled(True)
-        self.llama_stop_button.setEnabled(False)
+        # This slot is not used anymore, as the status is updated per model
+        pass
 
     @Slot(int)
-    def on_llama_runner_port_ready(self, port):
+    def on_llama_runner_port_ready(self, model_name: str, port: int):
         """
         Slot to handle the LlamaCppRunner port ready signal.
         """
-        self.llama_port_label.setText(f"Port: {port}")
+        self.model_port_labels[model_name].setText(f"Port: {port}")
+        self.model_status_labels[model_name].setText("Running")
 
 # Here's the first *SEARCH/REPLACE* block to modify the `main.py` file:
 #
