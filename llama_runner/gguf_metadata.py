@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import logging
+import traceback # Import traceback
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
@@ -35,13 +36,15 @@ def calculate_file_hash(filepath: str) -> str:
         with open(filepath, 'rb') as f:
             # Read the file in chunks to avoid large memory usage
             while chunk := f.read(4096):
-                hasher.update(hasher.update(chunk)) # Fixed: hasher.update(chunk) should be called once
+                # FIX: Corrected the typo here. hasher.update should be called once.
+                hasher.update(chunk)
         return hasher.hexdigest()
     except FileNotFoundError:
         logging.error(f"File not found for hashing: {filepath}")
         return ""
     except Exception as e:
-        logging.error(f"Error calculating hash for {filepath}: {e}")
+        # Add traceback to hashing error logging
+        logging.error(f"Error calculating hash for {filepath}: {e}\n{traceback.format_exc()}")
         return ""
 
 def get_metadata_cache_path(model_name: str, file_hash: str) -> str:
@@ -100,12 +103,18 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                 # This might return a list/tuple even for scalar types in some cases
                 value = field.parts[field.data[0]]
                 metadata[key] = value
+                # Add detailed logging for extracted values, especially non-scalar ones
+                if isinstance(value, (list, tuple)):
+                     logging.debug(f"Extracted list/tuple metadata for key '{key}': Type={type(value)}, Length={len(value)}, Value={value}")
+                else:
+                     logging.debug(f"Extracted scalar metadata for key '{key}': Type={type(value)}, Value={value}")
+
             except (IndexError, TypeError, AttributeError) as e:
                 logging.warning(f"Could not extract value for key '{key}' from {model_path}: {e}")
                 metadata[key] = None # Store None or skip? Store None for now.
             except Exception as e:
                  # Catch any other unexpected errors during extraction
-                 logging.warning(f"Unexpected error extracting value for key '{key}' from {model_path}: {e}")
+                 logging.warning(f"Unexpected error extracting value for key '{key}' from {model_path}: {e}\n{traceback.format_exc()}")
                  metadata[key] = None
 
         # Helper to safely get a scalar value from metadata, handling lists/tuples
@@ -229,7 +238,8 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         return lmstudio_format
 
     except Exception as e:
-        logging.error(f"Error extracting GGUF metadata from {model_path}: {e}")
+        # Add traceback to the main extraction error logging
+        logging.error(f"Error extracting GGUF metadata from {model_path}: {e}\n{traceback.format_exc()}")
         return None
 
 def get_model_lmstudio_format(model_name: str, model_path: str, is_running: bool) -> Optional[Dict[str, Any]]:
