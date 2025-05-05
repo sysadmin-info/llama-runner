@@ -11,7 +11,8 @@ import uvicorn
 
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel,
                                QPushButton, QLineEdit, QTabWidget)
-from PySide6.QtCore import QThread, QObject, pyqtSignal, Slot
+from PySide6.QtCore import QThread, QObject
+from PySide6.QtCore import pyqtSignal, Slot
 
 from llama_runner.config_loader import load_config
 from llama_runner.llama_cpp_runner import LlamaCppRunner
