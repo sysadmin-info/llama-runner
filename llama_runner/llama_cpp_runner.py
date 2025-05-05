@@ -25,7 +25,7 @@ class LlamaCppRunner:
         """
         self.model_name = model_name
         self.model_path = model_path
-        self.llama_cpp_runtime = llama_cpp_runtime or "llama-server"
+        self.llama_cpp_runtime = llama_cpp_runtime
         self.kwargs = kwargs
         self.process: subprocess.Popen = None
         self.startup_pattern = re.compile(r"main: server is listening on")  # Regex to detect startup
@@ -132,12 +132,15 @@ async def main():
         with open(model_path, "w") as f:
             f.write("This is a dummy model file.")
 
+    # Load model-specific config, if available
+    model_config = config.get("models", {}).get(model_name, {})
+    llama_cpp_runtime = llama_runtimes.get(model_config.get("llama_cpp_runtime", "default"), "llama-server")
+
     runner = LlamaCppRunner(
         model_name=model_name,
         model_path=model_path,
-        llama_cpp_runtime=llama_runtimes.get("experimental", default_runtime),
-        ctx_size=2048,
-        gpu_layers=32
+        llama_cpp_runtime=llama_cpp_runtime,
+        **model_config.get("parameters", {})
     )
 
     await runner.start()

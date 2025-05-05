@@ -44,6 +44,7 @@ def load_config():
     try:
         with open(CONFIG_FILE, "r") as f:
             config = json.load(f)
+            print(f"Loaded config: {config}")  # Print loaded config
             return config
     except (OSError, json.JSONDecodeError) as e:
         print(f"Error loading config file: {e}")
