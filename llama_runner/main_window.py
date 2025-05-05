@@ -228,10 +228,10 @@ class LiteLLMProxyThread(QThread):
                     {
                         "model_name": "gpt-3.5-turbo", # This is the alias LiteLLM will use
                         "litellm_params": {
-                            "model": self.model_name, # This is the model_name from config.json passed from the UI
-                            "api_key": "os.environ/OPENAI_API_KEY", # Placeholder, not needed for llama.cpp
-                            "custom_llm_provider": "llama_cpp",
+                            # Use 'openai' provider and point api_base to the llama.cpp server
+                            "model": "openai/gpt-3.5-turbo", # Use openai provider, model name can be anything for openai-compatible
                             "api_base": f"http://127.0.0.1:{self.llama_cpp_port}"
+                            # Removed "custom_llm_provider": "llama_cpp"
                         }
                     }
                 ],
