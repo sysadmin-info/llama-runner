@@ -35,7 +35,7 @@ def calculate_file_hash(filepath: str) -> str:
         with open(filepath, 'rb') as f:
             # Read the file in chunks to avoid large memory usage
             while chunk := f.read(4096):
-                hasher.update(chunk)
+                hasher.update(hasher.update(chunk)) # Fixed: hasher.update(chunk) should be called once
         return hasher.hexdigest()
     except FileNotFoundError:
         logging.error(f"File not found for hashing: {filepath}")
@@ -97,17 +97,38 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
             try:
                 # Access the value using the method shown in the example reader.py
                 # field.data[0] is the index into field.parts
+                # This might return a list/tuple even for scalar types in some cases
                 value = field.parts[field.data[0]]
                 metadata[key] = value
             except (IndexError, TypeError, AttributeError) as e:
                 logging.warning(f"Could not extract value for key '{key}' from {model_path}: {e}")
                 metadata[key] = None # Store None or skip? Store None for now.
+            except Exception as e:
+                 # Catch any other unexpected errors during extraction
+                 logging.warning(f"Unexpected error extracting value for key '{key}' from {model_path}: {e}")
+                 metadata[key] = None
+
+        # Helper to safely get a scalar value from metadata, handling lists/tuples
+        def get_scalar_metadata(key: str, default: Any = None) -> Any:
+            value = metadata.get(key)
+            if isinstance(value, (list, tuple)):
+                if len(value) > 0:
+                    # Return the first element for lists/tuples
+                    return value[0]
+                else:
+                    # Return default for empty lists/tuples
+                    return default
+            elif value is None:
+                 return default
+            else:
+                # Return the value directly if it's not a list/tuple
+                return value
 
 
         # --- Construct LM Studio format based on requested fields ---
 
         # id: general.name (fallback to filename)
-        model_id = metadata.get('general.name', os.path.basename(model_path))
+        model_id = get_scalar_metadata('general.name', os.path.basename(model_path))
 
         # object: "model" (static)
         obj_type = "model" # Static value as per LM Studio API
@@ -115,9 +136,10 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         # type: "llm", "vlm", "embeddings" (detected)
         # Check metadata keys first
         model_type = "llm" # Default to llm
-        if metadata.get("ggml.model.type") == "embedding":
+        ggml_model_type = get_scalar_metadata("ggml.model.type")
+        if ggml_model_type == "embedding":
              model_type = "embeddings"
-        elif metadata.get("ggml.model.type") == "vlm":
+        elif ggml_model_type == "vlm":
              model_type = "vlm"
         # Fallback to filename heuristic if metadata key is missing
         elif "embedding" in os.path.basename(model_path).lower() or "embed" in os.path.basename(model_path).lower():
@@ -127,21 +149,26 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
 
 
         # publisher: general.quantized_by (fallback to general.url, then local)
-        publisher = metadata.get('general.quantized_by', metadata.get('general.url', 'local'))
+        publisher = get_scalar_metadata('general.quantized_by', get_scalar_metadata('general.url', 'local'))
 
         # arch: general.architecture (fallback to unknown)
-        architecture = metadata.get('general.architecture', 'unknown')
+        architecture = get_scalar_metadata('general.architecture', 'unknown')
 
         # compatibility_type: "gguf" (static)
         compatibility_type = "gguf" # Static value
 
         # quantization: GGMLQuantizationType(general.file_type).name (fallback to heuristic)
         quantization = "Unknown"
-        file_type = metadata.get('general.file_type')
+        file_type = get_scalar_metadata('general.file_type') # Use the helper
         if GGUF_AVAILABLE and file_type is not None:
             try:
                 # Attempt to use the enum name
-                quantization = GGMLQuantizationType(file_type).name
+                # Ensure file_type is an integer if it came from metadata
+                if isinstance(file_type, int):
+                    quantization = GGMLQuantizationType(file_type).name
+                else:
+                    logging.warning(f"'general.file_type' is not an integer ({type(file_type)}) in {model_path}. Value: {file_type}")
+                    # Fall through to heuristic
             except ValueError:
                 logging.warning(f"Unknown GGMLQuantizationType value: {file_type} for {model_path}")
                 quantization = f"Type_{file_type}" # Fallback if enum value is unknown
@@ -153,10 +180,10 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
              if "q4_k_m" in os.path.basename(model_path).lower():
                   quantization = "Q4_K_M" # Common convention
              # Fallback: Check if quantization info is directly in metadata keys (e.g., "quantization.method")
-             elif metadata.get("quantization.method"):
-                  quantization = metadata["quantization.method"]
-             elif metadata.get("quantization_version"): # Sometimes just a version number
-                  quantization = f"Q{metadata['quantization_version']}"
+             elif get_scalar_metadata("quantization.method"):
+                  quantization = get_scalar_metadata("quantization.method")
+             elif get_scalar_metadata("quantization_version"): # Sometimes just a version number
+                  quantization = f"Q{get_scalar_metadata('quantization_version')}"
 
 
         # max_context_length: ${general.architecture}.context_length (fallback to common keys, then default)
@@ -164,14 +191,25 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         if architecture != 'unknown':
              # Try the architecture-specific key
              ctx_key = f'{architecture}.context_length'
-             max_ctx = metadata.get(ctx_key, max_ctx)
+             arch_ctx = get_scalar_metadata(ctx_key)
+             if arch_ctx is not None:
+                 max_ctx = arch_ctx
 
         # If architecture-specific key wasn't found or architecture was unknown, check common keys
-        if max_ctx == 4096 and architecture == 'unknown': # Only check common keys if default is still used and arch is unknown
-             max_ctx = metadata.get('llama.context_length', max_ctx)
-             max_ctx = metadata.get('phi3.context_length', max_ctx)
-             max_ctx = metadata.get('qwen2.context_length', max_ctx)
+        # Only check common keys if the current max_ctx is still the default or None
+        if max_ctx == 4096 or max_ctx is None:
+             max_ctx = get_scalar_metadata('llama.context_length', max_ctx)
+             max_ctx = get_scalar_metadata('phi3.context_length', max_ctx)
+             max_ctx = get_scalar_metadata('qwen2.context_length', max_ctx)
              # Add other common architecture keys here if needed
+
+        # Ensure max_ctx is an integer
+        if not isinstance(max_ctx, int):
+             try:
+                 max_ctx = int(max_ctx)
+             except (ValueError, TypeError):
+                 logging.warning(f"Could not convert max_context_length '{max_ctx}' to integer for {model_path}. Defaulting to 4096.")
+                 max_ctx = 4096
 
 
         # Construct the final LM Studio format dictionary
