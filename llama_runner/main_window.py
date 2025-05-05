@@ -79,8 +79,9 @@ class LlamaRunnerThread(QThread):
         finally:
             if self.runner:
                 await self.runner.stop()
-            if self.is_running:
-                self.stopped.emit()
+        finally:
+            self.is_running = False
+            self.stopped.emit()
 
     def stop(self):
         """
@@ -349,7 +350,9 @@ class MainWindow(QWidget):
             self.model_status_labels[model_name].setText("Error")
             self.model_buttons[model_name].setEnabled(True)
             self.model_port_labels[model_name].setText("Port: N/A")
-            self.llama_runner_threads.pop(model_name, None)
+        finally:
+            if model_name in self.llama_runner_threads:
+                self.llama_runner_threads.pop(model_name, None)
         else:
             QMessageBox.critical(self, "Llama Runner Error", f"Llama Runner Error: {message}")
 
