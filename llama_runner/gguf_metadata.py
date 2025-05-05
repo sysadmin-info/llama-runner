@@ -6,6 +6,14 @@ import traceback # Import traceback
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
+# Attempt to import numpy
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    logging.warning("The 'numpy' library is not installed. Handling of numpy array metadata may be limited.")
+    NUMPY_AVAILABLE = False
+
 # Attempt to import the gguf library and specific components
 try:
     from gguf import GGUFReader
@@ -36,7 +44,7 @@ def calculate_file_hash(filepath: str) -> str:
         with open(filepath, 'rb') as f:
             # Read the file in chunks to avoid large memory usage
             while chunk := f.read(4096):
-                hasher.update(chunk) # Corrected typo
+                hasher.update(chunk)
         return hasher.hexdigest()
     except FileNotFoundError:
         logging.error(f"File not found for hashing: {filepath}")
@@ -105,6 +113,8 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                 # Add detailed logging for extracted values, especially non-scalar ones
                 if isinstance(value, (list, tuple)):
                      logging.debug(f"Extracted list/tuple metadata for key '{key}': Type={type(value)}, Length={len(value)}, Value={value}")
+                elif NUMPY_AVAILABLE and isinstance(value, (np.ndarray, np.memmap)):
+                     logging.debug(f"Extracted numpy array metadata for key '{key}': Type={type(value)}, Shape={value.shape}, Value={value}")
                 else:
                      logging.debug(f"Extracted scalar metadata for key '{key}': Type={type(value)}, Value={value}")
 
@@ -119,34 +129,52 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         # Helper to safely get a scalar value from metadata, handling lists/tuples/arrays
         def get_scalar_metadata(key: str, default: Any = None) -> Any:
             value = metadata.get(key)
-            # Keep unwrapping lists/tuples/arrays until a non-container or None is found
+
+            # Handle numpy arrays/memmaps first
+            if NUMPY_AVAILABLE and isinstance(value, (np.ndarray, np.memmap)):
+                if value.size == 1:
+                    # If it's a single-element array, extract the scalar item
+                    try:
+                        return value.item()
+                    except Exception as e:
+                        logging.warning(f"Could not extract scalar item from numpy array for key '{key}': {e}")
+                        return default
+                elif value.ndim == 1:
+                    # If it's a 1D array with multiple elements, assume it's a string (bytes or char codes)
+                    try:
+                        # Attempt to decode bytes or convert array of numbers to string
+                        if value.dtype == np.uint8 or value.dtype == np.int8:
+                             # Assume bytes
+                             return bytes(value).decode('utf-8', errors='replace')
+                        else:
+                             # Attempt to convert array of numbers to string representation
+                             return np.array2string(value, separator=', ', max_line_width=np.inf)
+                    except Exception as e:
+                        logging.warning(f"Could not convert numpy array to string for key '{key}': {e}")
+                        return default
+                else:
+                    # Handle multi-dimensional arrays or other complex cases by returning default
+                    logging.warning(f"Unsupported numpy array shape/ndim for key '{key}': {value.shape}")
+                    return default
+
+            # Keep unwrapping lists/tuples until a non-container or None is found
             while isinstance(value, (list, tuple)) and len(value) > 0:
                 value = value[0]
-            # Also handle potential numpy arrays if gguf returns them
-            if hasattr(value, 'tolist') and callable(value.tolist):
-                 try:
-                     list_value = value.tolist()
-                     while isinstance(list_value, (list, tuple)) and len(list_value) > 0:
-                         list_value = list_value[0]
-                     value = list_value
-                 except Exception:
-                     pass # Ignore errors during tolist conversion
 
             if value is None:
                  return default
             else:
-                # Attempt to convert to string to handle various scalar types consistently
-                try:
-                    return str(value)
-                except Exception:
-                    logging.warning(f"Could not convert metadata value for key '{key}' to string: {value}")
-                    return default
+                # Return the value directly if it's not a list/tuple/array (after unwrapping)
+                return value
 
 
         # --- Construct LM Studio format based on requested fields ---
 
         # id: general.name (fallback to filename)
         model_id = get_scalar_metadata('general.name', os.path.basename(model_path))
+        # Ensure ID is a string
+        model_id = str(model_id) if model_id is not None else os.path.basename(model_path)
+
 
         # object: "model" (static)
         obj_type = "model" # Static value as per LM Studio API
@@ -155,9 +183,9 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         # Check metadata keys first
         model_type = "llm" # Default to llm
         ggml_model_type = get_scalar_metadata("ggml.model.type")
-        if ggml_model_type and ggml_model_type.lower() == "embedding":
+        if ggml_model_type and isinstance(ggml_model_type, str) and ggml_model_type.lower() == "embedding":
              model_type = "embeddings"
-        elif ggml_model_type and ggml_model_type.lower() == "vlm":
+        elif ggml_model_type and isinstance(ggml_model_type, str) and ggml_model_type.lower() == "vlm":
              model_type = "vlm"
         # Fallback to filename heuristic if metadata key is missing
         elif "embedding" in os.path.basename(model_path).lower() or "embed" in os.path.basename(model_path).lower():
@@ -168,9 +196,15 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
 
         # publisher: general.quantized_by (fallback to general.url, then local)
         publisher = get_scalar_metadata('general.quantized_by', get_scalar_metadata('general.url', 'local'))
+        # Ensure publisher is a string
+        publisher = str(publisher) if publisher is not None else 'local'
+
 
         # arch: general.architecture (fallback to unknown)
         architecture = get_scalar_metadata('general.architecture', 'unknown')
+        # Ensure architecture is a string
+        architecture = str(architecture) if architecture is not None else 'unknown'
+
 
         # compatibility_type: "gguf" (static)
         compatibility_type = "gguf" # Static value
@@ -213,6 +247,8 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                   quantization = get_scalar_metadata("quantization.method")
              elif get_scalar_metadata("quantization_version"): # Sometimes just a version number
                   quantization = f"Q{get_scalar_metadata('quantization_version')}"
+        # Ensure quantization is a string
+        quantization = str(quantization) if quantization is not None else 'Unknown'
 
 
         # max_context_length: ${general.architecture}.context_length (fallback to default)
@@ -221,12 +257,12 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         if architecture != 'unknown':
              # Try the architecture-specific key
              ctx_key = f'{architecture}.context_length'
-             arch_ctx_str = get_scalar_metadata(ctx_key)
-             if arch_ctx_str is not None:
+             arch_ctx_val = get_scalar_metadata(ctx_key) # Use the helper
+             if arch_ctx_val is not None:
                  try:
-                     max_ctx = int(arch_ctx_str)
+                     max_ctx = int(arch_ctx_val)
                  except (ValueError, TypeError):
-                     logging.warning(f"Could not convert architecture-specific context_length '{arch_ctx_str}' to integer for {model_path}. Using default 4096.")
+                     logging.warning(f"Could not convert architecture-specific context_length '{arch_ctx_val}' to integer for {model_path}. Using default 4096.")
                      max_ctx = 4096 # Ensure it's the default if conversion fails
              else:
                  logging.warning(f"Architecture-specific context_length key '{ctx_key}' not found for {model_path}. Using default 4096.")
