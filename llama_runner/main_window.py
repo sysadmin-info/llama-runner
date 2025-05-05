@@ -335,7 +335,7 @@ class MainWindow(QWidget):
         self.litellm_stop_button = QPushButton("Stop LiteLLM Proxy")
         self.litellm_layout.addWidget(self.litellm_start_button)
         self.litellm_layout.addWidget(self.litellm_stop_button)
-        selfellm_layout.addStretch() # Add stretch to push buttons to the top
+        self.litellm_layout.addStretch() # Add stretch to push buttons to the top
         self.litellm_tab.setLayout(self.litellm_layout)
         self.tabs.addTab(self.litellm_tab, "LiteLLM Proxy")
 
