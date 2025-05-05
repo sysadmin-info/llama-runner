@@ -20,12 +20,17 @@ try:
     # Corrected import: Use LlamaFileType instead of GGMLQuantizationType
     from gguf.gguf_reader import LlamaFileType # Import the correct enum
     GGUF_AVAILABLE = True
-except ImportError:
-    logging.warning("The 'gguf' library is not installed or LlamaFileType is missing. Metadata extraction will be disabled.")
+    logging.debug("Successfully imported GGUFReader and LlamaFileType.") # Debug log for success
+except ImportError as e:
+    logging.warning(f"ImportError: The 'gguf' library or required components are missing: {e}. Metadata extraction will be disabled.")
     GGUF_AVAILABLE = False
 except Exception as e:
     logging.warning(f"Error importing gguf components: {e}. Metadata extraction may be limited.")
     GGUF_AVAILABLE = False # Treat as unavailable if import fails unexpectedly
+
+# --- Add debug logging for GGUF_AVAILABLE status ---
+logging.debug(f"GGUF_AVAILABLE status after import attempt: {GGUF_AVAILABLE}")
+# --- End debug logging ---
 
 
 from llama_runner.config_loader import CONFIG_DIR # Assuming CONFIG_DIR is defined here
@@ -90,6 +95,10 @@ def save_metadata_to_cache(model_name: str, file_size: int, metadata: Dict[str, 
 
 def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
     """Extracts relevant metadata from a GGUF file."""
+    # --- Add debug logging at the start of the function ---
+    logging.debug(f"Attempting to extract GGUF metadata from: {model_path}")
+    # --- End debug logging ---
+
     if not GGUF_AVAILABLE:
         logging.error("GGUF library not available. Cannot extract metadata.")
         return None
@@ -293,11 +302,17 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         }
 
         logging.info(f"Successfully extracted metadata for {model_path}")
+        # --- Add debug logging for the return value ---
+        logging.debug(f"Successfully extracted metadata for {model_path}: {lmstudio_format}")
+        # --- End debug logging ---
         return lmstudio_format
 
     except Exception as e:
         # Add traceback to the main extraction error logging
         logging.error(f"Error extracting GGUF metadata from {model_path}: {e}\n{traceback.format_exc()}")
+        # --- Add debug logging for the return value on error ---
+        logging.debug(f"Metadata extraction failed for {model_path}. Returning None.")
+        # --- End debug logging ---
         return None
 
 def get_model_lmstudio_format(model_name: str, model_path: str, is_running: bool) -> Optional[Dict[str, Any]]:
