@@ -5,12 +5,13 @@ import os
 import tempfile
 import yaml
 import logging
+import traceback # Import traceback for detailed error logging
 
 from litellm.proxy.proxy_server import app
 import uvicorn
 
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel,
-                               QPushButton, QLineEdit, QTabWidget)
+                               QPushButton, QLineEdit, QTabWidget, QMessageBox) # Import QMessageBox
 from PySide6.QtCore import QThread, QObject, Signal, Slot
 
 from llama_runner.config_loader import load_config
@@ -36,14 +37,25 @@ class LlamaRunnerThread(QThread):
         self.kwargs = kwargs
         self.runner = None
         self.is_running = False
+        self._error_emitted = False # Flag to track if error signal was emitted
 
     def run(self):
         """
         Runs the LlamaCppRunner in the thread.
         """
         self.is_running = True
-        asyncio.run(self.run_async())
-        self.is_running = False
+        self._error_emitted = False # Reset flag
+        try:
+            asyncio.run(self.run_async())
+        except Exception as e:
+            # This catch is mostly for unexpected errors in the asyncio loop itself
+            logging.error(f"Unexpected error in LlamaRunnerThread run: {e}\n{traceback.format_exc()}")
+            if not self._error_emitted:
+                 self.error.emit(f"Unexpected thread error: {e}")
+                 self._error_emitted = True
+        finally:
+            self.is_running = False
+            # The stopped signal is emitted in run_async's finally block
 
     async def run_async(self):
         """
@@ -57,36 +69,71 @@ class LlamaRunnerThread(QThread):
                 **self.kwargs
             )
             await self.runner.start()
+
+            # Check if process started successfully
+            if not self.runner.process or self.runner.process.poll() is not None:
+                 raise RuntimeError("Llama.cpp server process failed to start.")
+
+            startup_success = await self.runner.wait_for_server_startup()
+
+            # Check if startup message was found and port was set
+            if not startup_success or self.runner.port is None:
+                 # Check if the process exited during startup wait
+                 if self.runner.process.poll() is not None:
+                     return_code = self.runner.process.returncode
+                     raise RuntimeError(f"Llama.cpp server exited during startup with code {return_code}.")
+                 else:
+                     raise RuntimeError("Llama.cpp server startup message not found or port not extracted.")
+
+
             self.started.emit()
             self.port_ready.emit(self.runner.get_port()) # Emit the port number
 
-            # Keep the runner alive until the thread is stopped
-            while self.is_running:
+            # Keep the runner alive until the thread is stopped or process exits
+            while self.is_running and self.runner.is_running():
                 await asyncio.sleep(1)
-            await self.runner.stop()
 
-            # Check if the process exited with an error
-            if self.runner.process.returncode != 0:
-                error_message = f"Llama.cpp server exited with code {self.runner.process.returncode}"
-                logging.error(error_message)
-                self.error.emit(error_message)  # Emit the error message
-            else:
-                self.stopped.emit()
+            # If loop exited because self.is_running became False (clean stop requested)
+            if not self.is_running and self.runner.is_running():
+                 await self.runner.stop() # Stop the process
+
+            # If loop exited because process stopped unexpectedly (self.is_running is still True)
+            # The finally block will handle checking return code and emitting error/stopped
 
         except Exception as e:
-            logging.error(f"Error running LlamaCppRunner: {e}")
+            logging.error(f"Error running LlamaCppRunner: {e}\n{traceback.format_exc()}")
             self.error.emit(str(e))  # Emit the error message
+            self._error_emitted = True # Set flag
+
         finally:
-            if self.runner:
-                await self.runner.stop()
-        self.is_running = False
-        self.stopped.emit()
+            # Ensure the runner process is stopped if it's still running
+            if self.runner and self.runner.is_running():
+                logging.warning(f"Llama.cpp process for {self.model_name} was still running in finally block, stopping.")
+                try:
+                    await self.runner.stop()
+                except Exception as stop_e:
+                    logging.error(f"Error stopping LlamaCppRunner in finally: {stop_e}\n{traceback.format_exc()}")
+                    # Don't overwrite the main error_occurred flag
+
+            # Check the final return code after ensuring the process is stopped
+            # Only emit error if one hasn't been emitted by the except block
+            if not self._error_emitted and self.runner and self.runner.process and self.runner.process.returncode != 0:
+                error_message = f"Llama.cpp server for {self.model_name} exited with code {self.runner.process.returncode}"
+                logging.error(error_message)
+                self.error.emit(error_message)
+                self._error_emitted = True # Set flag
+
+            self.is_running = False # Ensure this is false
+            self.stopped.emit() # Always emit stopped when the thread is truly finished
+
 
     def stop(self):
         """
-        Stops the LlamaCppRunner.
+        Signals the LlamaCppRunner thread to stop.
+        The actual stopping happens in run_async.
         """
         self.is_running = False
+
 
 class LiteLLMProxyThread(QThread):
     """
@@ -96,16 +143,22 @@ class LiteLLMProxyThread(QThread):
         super().__init__()
         self.model_name = model_name
         self.llama_cpp_port = llama_cpp_port
-        self.process = None
+        self.process = None # LiteLLM proxy is run embedded, not as a separate process
         self.is_running = False
+        self._uvicorn_server = None # Hold reference to the uvicorn server
 
     def run(self):
         """
         Runs the LiteLLM proxy in the thread.
         """
         self.is_running = True
-        asyncio.run(self.run_async())
-        self.is_running = False
+        try:
+            asyncio.run(self.run_async())
+        except Exception as e:
+            logging.error(f"Unexpected error in LiteLLMProxyThread run: {e}\n{traceback.format_exc()}")
+        finally:
+            self.is_running = False
+
 
     async def run_async(self):
         """
@@ -117,49 +170,68 @@ class LiteLLMProxyThread(QThread):
             proxy_config = {
                 "model_list": [
                     {
-                        "model_name": "gpt-3.5-turbo",
+                        "model_name": "gpt-3.5-turbo", # This is the alias LiteLLM will use
                         "litellm_params": {
-                            "model": self.model_name,
-                            "api_key": "os.environ/OPENAI_API_KEY",
+                            "model": self.model_name, # This is the model_name from config.json passed from the UI
+                            "api_key": "os.environ/OPENAI_API_KEY", # Placeholder, not needed for llama.cpp
                             "custom_llm_provider": "llama_cpp",
                             "api_base": f"http://127.0.0.1:{self.llama_cpp_port}"
                         }
                     }
                 ],
                 "general_settings": {
-                    "master_key": "sk-xxx"
+                    "master_key": "sk-xxx" # Placeholder
                 }
             }
 
             # 2. Dump to a temp YAML file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".yaml") as f:
+            # Use a persistent temp file that we can clean up later
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".yaml", mode='w') as f:
                 yaml.dump(proxy_config, f)
                 tmp_path = f.name
+            logging.info(f"LiteLLM proxy config written to {tmp_path}")
 
             # 3. Point LiteLLM at that file
             os.environ["CONFIG_FILE_PATH"] = tmp_path
 
             # 4. Start the proxy embedded via Uvicorn
-            uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=4000, reload=True)
-            server = uvicorn.Server(uvicorn_config)
-            await server.serve()
+            # We need to run uvicorn's serve() method in the asyncio loop
+            uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=4000, reload=False) # reload=False in embedded mode
+            self._uvicorn_server = uvicorn.Server(uvicorn_config)
+
+            # This call is blocking until the server stops
+            await self._uvicorn_server.serve()
+
+            # Clean up the temporary config file after the server stops
+            try:
+                os.unlink(tmp_path)
+                logging.info(f"Cleaned up temporary LiteLLM config file: {tmp_path}")
+            except OSError as e:
+                logging.error(f"Error cleaning up temporary LiteLLM config file {tmp_path}: {e}")
+
 
         except Exception as e:
             print(f"Error starting LiteLLM Proxy: {e}")
+            logging.error(f"Error starting LiteLLM Proxy: {e}\n{traceback.format_exc()}")
         finally:
-            if self.process:
-                self.process.terminate()
-                self.process.wait()
+            # The uvicorn server.serve() call blocks until it's stopped,
+            # so cleanup happens after it returns.
             print("LiteLLM Proxy stopped.")
+
 
     def stop(self):
         """
-        Stops the LiteLLM proxy.
+        Signals the LiteLLM proxy thread to stop.
         """
         self.is_running = False
-        if self.process:
-            self.process.terminate()
-            self.process.wait()
+        if self._uvicorn_server:
+            # This will cause the server.serve() await call to return
+            self._uvicorn_server.should_exit = True
+            # Note: Stopping uvicorn gracefully can be tricky in an embedded context.
+            # This might not immediately stop the serve() call.
+            # A more robust stop might involve sending a signal or using a shutdown event.
+            # For now, setting should_exit is the standard uvicorn way.
+
 
 class MainWindow(QWidget):
     def __init__(self):
@@ -189,12 +261,15 @@ class MainWindow(QWidget):
         self.model_status_labels = {}
         self.model_port_labels = {}
 
+        # Create a layout for model buttons and status
+        self.model_widgets_layout = QVBoxLayout()
+
         for model_name, model_config in self.models.items():
             model_button_layout = QVBoxLayout()
-            model_label = QLabel(f"{model_name}:")
+            model_label = QLabel(f"<b>{model_name}</b>:") # Make model name bold
             model_button_layout.addWidget(model_label)
 
-            status_label = QLabel("Not Running")
+            status_label = QLabel("Status: Not Running") # Add "Status: " prefix
             model_button_layout.addWidget(status_label)
             self.model_status_labels[model_name] = status_label
 
@@ -203,15 +278,27 @@ class MainWindow(QWidget):
             self.model_port_labels[model_name] = port_label
 
             start_button = QPushButton(f"Start {model_name}")
+            # Use a lambda to pass the model_name to the slot
             start_button.clicked.connect(lambda checked, name=model_name: self.start_llama_runner(name))
             model_button_layout.addWidget(start_button)
             self.model_buttons[model_name] = start_button
 
+            # Add a spacer or separator between model sections if needed
+            # self.model_widgets_layout.addLayout(model_button_layout)
+            # self.model_widgets_layout.addStretch() # Add stretch between models
+
+            # Add the model's layout to the main model widgets layout
+            self.model_widgets_layout.addLayout(model_button_layout)
+
+
         self.stop_all_button = QPushButton("Stop All Llama Runners")
         self.stop_all_button.clicked.connect(self.stop_all_llama_runners)
+
+        # Add the model widgets layout and the stop all button to the main llama layout
+        self.llama_layout.addLayout(self.model_widgets_layout)
         self.llama_layout.addStretch()  # Add stretch to push buttons to the top
-        self.llama_layout.addLayout(model_button_layout)
         self.llama_layout.addWidget(self.stop_all_button)
+
         self.llama_tab.setLayout(self.llama_layout)
         self.tabs.addTab(self.llama_tab, "Llama Runner")
 
@@ -225,6 +312,7 @@ class MainWindow(QWidget):
         self.litellm_stop_button = QPushButton("Stop LiteLLM Proxy")
         self.litellm_layout.addWidget(self.litellm_start_button)
         self.litellm_layout.addWidget(self.litellm_stop_button)
+        self.litellm_layout.addStretch() # Add stretch to push buttons to the top
         self.litellm_tab.setLayout(self.litellm_layout)
         self.tabs.addTab(self.litellm_tab, "LiteLLM Proxy")
 
@@ -232,8 +320,6 @@ class MainWindow(QWidget):
         self.setLayout(self.layout)
 
         # Connect buttons to actions
-        # self.llama_start_button.clicked.connect(self.start_llama_runner) # REMOVE
-        # self.llama_stop_button.clicked.connect(self.stop_llama_runner) # REMOVE
         self.litellm_start_button.clicked.connect(self.start_litellm_proxy)
         self.litellm_stop_button.clicked.connect(self.stop_litellm_proxy)
 
@@ -245,263 +331,215 @@ class MainWindow(QWidget):
             print(f"Model {model_name} not found in config.")
             return
 
+        # Stop any currently running instance of this model first
+        if model_name in self.llama_runner_threads and self.llama_runner_threads[model_name].isRunning():
+             print(f"Stopping existing Llama Runner for {model_name} before starting a new one.")
+             self.stop_llama_runner(model_name)
+             # Wait briefly for the stop to process signals if necessary
+             QApplication.processEvents() # Process events to allow stop signals to be handled
+
         model_config = self.models[model_name]
         model_path = model_config.get("model_path")
-        llama_cpp_runtime = self.llama_runtimes.get(model_config.get("llama_cpp_runtime", "default"), self.default_runtime)
+        llama_cpp_runtime_key = model_config.get("llama_cpp_runtime", "default")
+        llama_cpp_runtime = self.llama_runtimes.get(llama_cpp_runtime_key, self.default_runtime)
 
-        if model_name not in self.llama_runner_threads or not self.llama_runner_threads[model_name].isRunning():
-            self.llama_runner_threads[model_name] = LlamaRunnerThread(
-                model_name=model_name,
-                model_path=model_path,
-                llama_cpp_runtime=llama_cpp_runtime,
-                **model_config.get("parameters", {})
-            )
-            self.llama_runner_threads[model_name].started.connect(self.on_llama_runner_started)
-            self.llama_runner_threads[model_name].stopped.connect(self.on_llama_runner_stopped)
-            self.llama_runner_threads[model_name].error.connect(self.on_llama_runner_error)
-            self.llama_runner_threads[model_name].port_ready.connect(lambda port, name=model_name: self.on_llama_runner_port_ready(name, port))
-            self.llama_runner_threads[model_name].start()
+        if not model_path:
+             QMessageBox.critical(self, "Configuration Error", f"Model '{model_name}' has no 'model_path' specified in config.json.")
+             return
 
-            self.model_status_labels[model_name].setText("Starting...")
-            self.model_buttons[model_name].setEnabled(False)
-        else:
-            print(f"Llama Runner for {model_name} is already running.")
+        # Check if the model file exists
+        if not os.path.exists(model_path):
+             QMessageBox.critical(self, "File Not Found", f"Model file not found: {model_path}")
+             return
+
+        # Check if the runtime executable exists if it's not the default "llama-server" (which is expected in PATH)
+        if llama_cpp_runtime_key != "default" and not os.path.exists(llama_cpp_runtime):
+             QMessageBox.critical(self, "Runtime Not Found", f"Llama.cpp runtime not found: {llama_cpp_runtime}")
+             return
+
+
+        print(f"Starting Llama Runner for {model_name}...")
+        self.model_status_labels[model_name].setText("Status: Starting...")
+        self.model_buttons[model_name].setEnabled(False)
+        self.model_port_labels[model_name].setText("Port: N/A") # Clear old port
+
+        thread = LlamaRunnerThread(
+            model_name=model_name,
+            model_path=model_path,
+            llama_cpp_runtime=llama_cpp_runtime,
+            **model_config.get("parameters", {})
+        )
+        # Connect signals using partial or lambda to pass model_name
+        thread.started.connect(lambda: self.on_llama_runner_started(model_name))
+        thread.stopped.connect(lambda: self.on_llama_runner_stopped(model_name))
+        thread.error.connect(lambda msg: self.on_llama_runner_error(model_name, msg))
+        thread.port_ready.connect(lambda port: self.on_llama_runner_port_ready(model_name, port))
+
+        self.llama_runner_threads[model_name] = thread
+        thread.start()
+
 
     def stop_llama_runner(self, model_name: str):
         """
         Stops the LlamaCppRunner thread for a specific model.
         """
         if model_name in self.llama_runner_threads and self.llama_runner_threads[model_name].isRunning():
-            self.llama_runner_threads[model_name].stop()
-            self.llama_runner_threads[model_name].wait()  # Wait for the thread to finish
+            print(f"Stopping Llama Runner for {model_name}...")
+            self.model_status_labels[model_name].setText("Status: Stopping...")
+            # Button should already be disabled, but ensure it is
+            self.model_buttons[model_name].setEnabled(False)
+            # Port label might still show the port until stopped signal
+            # self.model_port_labels[model_name].setText("Port: N/A") # Clear port immediately? Or wait for stopped?
 
-            self.model_status_labels[model_name].setText("Not Running")
-            self.model_buttons[model_name].setEnabled(True)
-            self.model_port_labels[model_name].setText("Port: N/A")
+            self.llama_runner_threads[model_name].stop()
+            # Don't wait() here in the UI thread, it will freeze the UI.
+            # The thread will emit 'stopped' when it's done.
         else:
             print(f"Llama Runner for {model_name} is not running.")
+            # If it's not running but still in the dict (e.g. crashed before cleanup),
+            # clean up the UI state and dict entry.
+            if model_name in self.llama_runner_threads:
+                 print(f"Cleaning up state for non-running thread {model_name}")
+                 # Simulate the stopped signal handling
+                 self.on_llama_runner_stopped(model_name)
+
 
     def stop_all_llama_runners(self):
         """
         Stops all LlamaCppRunner threads.
         """
-        for model_name in list(self.llama_runner_threads.keys()):  # Iterate over a copy of the keys
+        print("Stopping all Llama Runners...")
+        # Iterate over a copy of the keys because stop_llama_runner modifies the dict
+        for model_name in list(self.llama_runner_threads.keys()):
             self.stop_llama_runner(model_name)
 
     def start_litellm_proxy(self):
         """
         Starts the LiteLLM proxy in a separate thread.
         """
-        # Find the first running Llama Runner to connect to
-        running_model_name = None
-        for model_name, thread in self.llama_runner_threads.items():
-            if thread.isRunning() and thread.runner is not None:
-                running_model_name = model_name
-                break
-
-        if not running_model_name:
-            print("No Llama Runner is running. Start one first.")
+        if self.litellm_proxy_thread is not None and self.litellm_proxy_thread.isRunning():
+            print("LiteLLM Proxy is already running.")
             return
 
-        if self.litellm_proxy_thread is None or not self.litellm_proxy_thread.isRunning():
-            self.litellm_proxy_thread = LiteLLMProxyThread(model_name=running_model_name, llama_cpp_port=self.llama_runner_threads[running_model_name].runner.get_port())
-            self.litellm_proxy_thread.start()
-            self.litellm_status_label.setText("Running...")
-        else:
-            print("LiteLLM Proxy is already running.")
+        # Find the first running Llama Runner to connect to
+        running_model_name = None
+        running_port = None
+        for model_name, thread in self.llama_runner_threads.items():
+            # Check if the thread is running AND the runner instance exists AND has a port
+            if thread.isRunning() and thread.runner is not None and thread.runner.get_port() is not None:
+                running_model_name = model_name
+                running_port = thread.runner.get_port()
+                break
+
+        if not running_model_name or running_port is None:
+            QMessageBox.warning(self, "LiteLLM Proxy", "No Llama Runner is currently running or port not available. Start one first.")
+            print("No Llama Runner is running or port not available. Cannot start LiteLLM Proxy.")
+            return
+
+        print(f"Starting LiteLLM Proxy for model '{running_model_name}' on port {running_port}...")
+        self.litellm_status_label.setText("Running...")
+        self.litellm_start_button.setEnabled(False)
+        self.litellm_stop_button.setEnabled(True)
+
+
+        self.litellm_proxy_thread = LiteLLMProxyThread(model_name=running_model_name, llama_cpp_port=running_port)
+        # LiteLLM proxy thread doesn't currently have error/stopped signals, could add later
+        self.litellm_proxy_thread.start()
+
 
     def stop_litellm_proxy(self):
         """
         Stops the LiteLLM proxy thread.
         """
         if self.litellm_proxy_thread and self.litellm_proxy_thread.isRunning():
+            print("Stopping LiteLLM Proxy...")
+            self.litellm_status_label.setText("Stopping...")
+            self.litellm_start_button.setEnabled(False)
+            self.litellm_stop_button.setEnabled(False)
+
             self.litellm_proxy_thread.stop()
-            self.litellm_proxy_thread.wait()  # Wait for the thread to finish
+            # Don't wait() here in the UI thread
+            # The thread will eventually finish and the status will update (manually for now)
+            # A signal from the proxy thread would be better here.
+            # For now, manually update status after signaling stop
             self.litellm_status_label.setText("Not Running")
+            self.litellm_start_button.setEnabled(True)
+            self.litellm_stop_button.setEnabled(False)
+
         else:
             print("LiteLLM Proxy is not running.")
+            self.litellm_status_label.setText("Not Running")
+            self.litellm_start_button.setEnabled(True)
+            self.litellm_stop_button.setEnabled(False)
 
-    @Slot()
-    def on_llama_runner_started(self):
+
+    @Slot(str)
+    def on_llama_runner_started(self, model_name: str):
         """
         Slot to handle the LlamaCppRunner started signal.
         """
-        # This slot is not used anymore, as the status is updated per model
-        pass
+        # Status is updated by port_ready, but we can ensure button is disabled
+        if model_name in self.model_buttons:
+             self.model_buttons[model_name].setEnabled(False)
+             self.model_status_labels[model_name].setText("Status: Starting...") # Update status to Starting if not already
 
-    @Slot()
-    def on_llama_runner_stopped(self):
-        """
-        Slot to handle the LlamaCppRunner stopped signal.
-        """
-        # This slot is not used anymore, as the status is updated per model
-        pass
 
     @Slot(str)
-    def on_llama_runner_error(self, message):
+    def on_llama_runner_stopped(self, model_name: str):
+        """
+        Slot to handle the LlamaCppRunner stopped signal.
+        Cleans up the thread reference and updates UI.
+        """
+        print(f"Llama Runner for {model_name} stopped.")
+        if model_name in self.llama_runner_threads:
+            # Clean up the thread object
+            thread = self.llama_runner_threads.pop(model_name)
+            thread.deleteLater() # Schedule for deletion
+
+            # Update UI for this model
+            if model_name in self.model_status_labels:
+                self.model_status_labels[model_name].setText("Status: Not Running")
+            if model_name in self.model_buttons:
+                self.model_buttons[model_name].setEnabled(True)
+            if model_name in self.model_port_labels:
+                self.model_port_labels[model_name].setText("Port: N/A")
+        else:
+            print(f"Stopped signal received for unknown or already cleaned up model: {model_name}")
+
+
+    @Slot(str, str) # Slot receives model_name and message
+    def on_llama_runner_error(self, model_name: str, message: str):
         """
         Slot to handle the LlamaCppRunner error signal.
+        Displays an error message and updates UI status.
         """
-        from PySide6.QtWidgets import QMessageBox
-        model_name = next((name for name, thread in self.llama_runner_threads.items() if thread == self.sender()), None)
-        if model_name:
-            QMessageBox.critical(self, "Llama Runner Error", f"Llama Runner ({model_name}) Error: {message}")
-            self.model_status_labels[model_name].setText("Error")
-            self.model_buttons[model_name].setEnabled(True)
-            self.model_port_labels[model_name].setText("Port: N/A")
-        if model_name in self.llama_runner_threads:
-            self.llama_runner_threads.pop(model_name, None)
-        else:
-            QMessageBox.critical(self, "Llama Runner Error", f"Llama Runner Error: {message}")
+        print(f"Llama Runner for {model_name} error: {message}")
+        # Show error message box
+        QMessageBox.critical(self, f"Llama Runner Error: {model_name}", f"Error: {message}")
 
-    @Slot(int)
+        # Update UI status for this model
+        if model_name in self.model_status_labels:
+            self.model_status_labels[model_name].setText("Status: Error")
+        # The stopped signal will follow and update the status to "Not Running" and re-enable the button
+
+
+    @Slot(str, int) # Slot receives model_name and port
     def on_llama_runner_port_ready(self, model_name: str, port: int):
         """
         Slot to handle the LlamaCppRunner port ready signal.
+        Updates the UI with the assigned port and status.
         """
-        self.model_port_labels[model_name].setText(f"Port: {port}")
-        self.model_status_labels[model_name].setText("Running")
+        print(f"Llama Runner for {model_name} ready on port {port}.")
+        if model_name in self.model_port_labels:
+            self.model_port_labels[model_name].setText(f"Port: {port}")
+        if model_name in self.model_status_labels:
+            self.model_status_labels[model_name].setText("Status: Running")
+        # Button should already be disabled
 
-# Here's the first *SEARCH/REPLACE* block to modify the `main.py` file:
-#
-# main.py
-# <source>python
-# <<<<<<< SEARCH
-# import asyncio
-# import os
-# import tempfile
-# import yaml
-# import logging
-# from litellm.proxy.proxy_server import app
-# import uvicorn
-#
-# from llama_runner.config_loader import load_config
-# from llama_runner.llama_cpp_runner import LlamaCppRunner, CONFIG_DIR
-# from llama_runner.main_window import MainWindow  # Import the MainWindow class
-#
-#
-# # Configure logging
-# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-#
-# # The main function now primarily sets up the UI.
-# # Async operations will be managed within the MainWindow class.
-# def main():
-#     # Load configuration (might be needed by the UI later)
-#     # config = load_config()
-#     # llama_runtimes = config.get("llama-runtimes", {})
-#     # default_runtime = "llama-server"  # Default to llama-server from PATH
-#     # model_name = "test-model"  # hardcoded for now
-#     # model_config = config.get("models", {}).get(model_name, {})
-#     # model_path = model_config.get("model_path")
-#     # llama_cpp_runtime = llama_runtimes.get(model_config.get("llama_cpp_runtime", "default"), default_runtime)
-#
-#     # Create the LlamaCppRunner instance (will be managed by the UI later)
-#     # runner = LlamaCppRunner(
-#     #     model_name=model_name,
-#     #     model_path=model_path,
-#     #     llama_cpp_runtime=llama_cpp_runtime,
-#     #     **model_config.get("parameters", {})
-#     # )
-#
-#     # await runner.start() # Will be managed by the UI later
-#
-#     # 1. Define your proxy config as a Python dict (will be managed by the UI later)
-#     # proxy_config = {
-#     #     "model_list": [
-#     #         {
-#     #             "model_name": "gpt-3.5-turbo",
-#     #             "litellm_params": {
-#     #                 "model": model_name,
-#     #                 "api_key": "os.environ/OPENAI_API_KEY",
-#     #                 "custom_llm_provider": "llama_cpp",
-#     #                 "api_base": f"http://127.0.0.1:{runner.get_port()}" # Needs runner instance
-#     #             }
-#     #         }
-#     #     ],
-#     #     "general_settings": {
-#     #         "master_key": "sk-xxx"
-#     #     }
-#     # }
-#
-#     # 2. Dump to a temp YAML file (will be managed by the UI later)
-#     # with tempfile.NamedTemporaryFile(delete=False, suffix=".yaml") as f:
-#     #     yaml.dump(proxy_config, f)
-#     #     tmp_path = f.name
-#
-#     # 3. Point LiteLLM at that file (will be managed by the UI later)
-#     # os.environ["CONFIG_FILE_PATH"] = tmp_path
-#
-#     # 4. Start the proxy embedded via Uvicorn (will be managed by the UI later)
-#     # uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=4000, reload=True)
-#     # server = uvicorn.Server(uvicorn_config)
-#     # await server.serve() # This needs to run in an async context, likely managed by the UI
-#
-#     # await runner.stop() # Will be managed by the UI later
-#
-#
-#     # Create the Qt application
-#     qt_app = QApplication(sys.argv)
-#
-#     # Create the main window
-#     # The MainWindow will need access to config and potentially create runners/servers
-#     window = MainWindow()
-#     window.show()
-#
-#     # Start the event loop
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# The main function is now in main.py
+# async def main():
+#    pass # REMOVE
 
-async def main():
-    config = load_config()
-    llama_runtimes = config.get("llama-runtimes", {})
-    default_runtime = "llama-server"  # Default to llama-server from PATH
-    model_name = "test-model" # hardcoded for now
-    model_config = config.get("models", {}).get(model_name, {})
-    model_path = model_config.get("model_path")
-    llama_cpp_runtime = llama_runtimes.get(model_config.get("llama_cpp_runtime", "default"), default_runtime)
-
-    runner = LlamaCppRunner(
-        model_name=model_name,
-        model_path=model_path,
-        llama_cpp_runtime=llama_cpp_runtime,
-        **model_config.get("parameters", {})
-    )
-
-    await runner.start()
-
-    # 1. Define your proxy config as a Python dict
-    proxy_config = {
-        "model_list": [
-            {
-                "model_name": "gpt-3.5-turbo",
-                "litellm_params": {
-                    "model": model_name,
-                    "api_key": "os.environ/OPENAI_API_KEY",
-                    "custom_llm_provider": "llama_cpp",
-                    "api_base": f"http://127.0.0.1:{runner.get_port()}"
-                }
-            }
-        ],
-        "general_settings": {
-            "master_key": "sk-xxx"
-        }
-    }
-
-    # 2. Dump to a temp YAML file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".yaml") as f:
-        yaml.dump(proxy_config, f)
-        tmp_path = f.name
-
-    # 3. Point LiteLLM at that file
-    os.environ["CONFIG_FILE_PATH"] = tmp_path
-
-    # 4. Start the proxy embedded via Uvicorn
-    uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=4000, reload=True)
-    server = uvicorn.Server(uvicorn_config)
-    await server.serve()
-
-    await runner.stop()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# if __name__ == "__main__":
+#    pass # REMOVE
