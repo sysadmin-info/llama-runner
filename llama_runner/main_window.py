@@ -64,14 +64,23 @@ class LlamaRunnerThread(QThread):
             while self.is_running:
                 await asyncio.sleep(1)
             await self.runner.stop()
-            self.stopped.emit()
+
+            # Check if the process exited with an error
+            if self.runner.process.returncode != 0:
+                error_message = f"Llama.cpp server exited with code {self.runner.process.returncode}"
+                logging.error(error_message)
+                self.error.emit(error_message)  # Emit the error message
+            else:
+                self.stopped.emit()
+
         except Exception as e:
             logging.error(f"Error running LlamaCppRunner: {e}")
             self.error.emit(str(e))  # Emit the error message
         finally:
             if self.runner:
                 await self.runner.stop()
-            self.stopped.emit()
+            if self.is_running:
+                self.stopped.emit()
 
     def stop(self):
         """
@@ -333,8 +342,16 @@ class MainWindow(QWidget):
         """
         Slot to handle the LlamaCppRunner error signal.
         """
-        # This slot is not used anymore, as the status is updated per model
-        pass
+        from PySide6.QtWidgets import QMessageBox
+        model_name = next((name for name, thread in self.llama_runner_threads.items() if thread == self.sender()), None)
+        if model_name:
+            QMessageBox.critical(self, "Llama Runner Error", f"Llama Runner ({model_name}) Error: {message}")
+            self.model_status_labels[model_name].setText("Error")
+            self.model_buttons[model_name].setEnabled(True)
+            self.model_port_labels[model_name].setText("Port: N/A")
+            self.llama_runner_threads.pop(model_name, None)
+        else:
+            QMessageBox.critical(self, "Llama Runner Error", f"Llama Runner Error: {message}")
 
     @Slot(int)
     def on_llama_runner_port_ready(self, model_name: str, port: int):
