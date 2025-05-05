@@ -215,7 +215,7 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                   quantization = f"Q{get_scalar_metadata('quantization_version')}"
 
 
-        # max_context_length: ${general.architecture}.context_length (fallback to common keys, then default)
+        # max_context_length: ${general.architecture}.context_length (fallback to default)
         max_ctx = 4096 # Default value
         # Use the architecture string obtained earlier
         if architecture != 'unknown':
@@ -226,35 +226,14 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                  try:
                      max_ctx = int(arch_ctx_str)
                  except (ValueError, TypeError):
-                     logging.warning(f"Could not convert architecture-specific context_length '{arch_ctx_str}' to integer for {model_path}. Using default or common keys.")
-                     # Fall through to check common keys
-
-        # If architecture-specific key wasn't found or architecture was unknown, check common keys
-        # Only check common keys if the current max_ctx is still the default or None
-        if max_ctx == 4096: # Check against the default value
-             common_ctx_str = get_scalar_metadata('llama.context_length')
-             if common_ctx_str is not None:
-                 try:
-                     max_ctx = int(common_ctx_str)
-                 except (ValueError, TypeError):
-                     logging.warning(f"Could not convert common context_length 'llama.context_length' ('{common_ctx_str}') to integer for {model_path}. Using default.")
-
-             if max_ctx == 4096: # Check again
-                 common_ctx_str = get_scalar_metadata('phi3.context_length')
-                 if common_ctx_str is not None:
-                     try:
-                         max_ctx = int(common_ctx_str)
-                     except (ValueError, TypeError):
-                         logging.warning(f"Could not convert common context_length 'phi3.context_length' ('{common_ctx_str}') to integer for {model_path}. Using default.")
-
-             if max_ctx == 4096: # Check again
-                 common_ctx_str = get_scalar_metadata('qwen2.context_length')
-                 if common_ctx_str is not None:
-                     try:
-                         max_ctx = int(common_ctx_str)
-                     except (ValueError, TypeError):
-                         logging.warning(f"Could not convert common context_length 'qwen2.context_length' ('{common_ctx_str}') to integer for {model_path}. Using default.")
-             # Add other common architecture keys here if needed
+                     logging.warning(f"Could not convert architecture-specific context_length '{arch_ctx_str}' to integer for {model_path}. Using default 4096.")
+                     max_ctx = 4096 # Ensure it's the default if conversion fails
+             else:
+                 logging.warning(f"Architecture-specific context_length key '{ctx_key}' not found for {model_path}. Using default 4096.")
+                 max_ctx = 4096 # Ensure it's the default if key is not found
+        else:
+             logging.warning(f"Architecture is unknown for {model_path}. Cannot determine architecture-specific context_length. Using default 4096.")
+             max_ctx = 4096 # Ensure it's the default if architecture is unknown
 
 
         # Ensure max_ctx is an integer (final check)
