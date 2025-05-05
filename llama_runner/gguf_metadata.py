@@ -87,14 +87,19 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         reader = GGUFReader(model_path, 'r')
         metadata = {}
 
-        # Extract common metadata
-        metadata['general.architecture'] = reader.get_val('general.architecture')
-        metadata['general.name'] = reader.get_val('general.name')
-        metadata['llama.context_length'] = reader.get_val('llama.context_length')
-        metadata['llama.block_count'] = reader.get_val('llama.block_count')
-        metadata['llama.embedding_length'] = reader.get_val('llama.embedding_length')
-        metadata['tokenizer.model'] = reader.get_val('tokenizer.model')
-        metadata['general.file_type'] = reader.get_val('general.file_type') # This might indicate quantization
+        # Helper to get key value safely
+        def get_key_value(key: str) -> Any:
+            gguf_value = reader.get_key(key)
+            return gguf_value.value if gguf_value else None
+
+        # Extract common metadata using get_key().value
+        metadata['general.architecture'] = get_key_value('general.architecture')
+        metadata['general.name'] = get_key_value('general.name')
+        metadata['llama.context_length'] = get_key_value('llama.context_length')
+        metadata['llama.block_count'] = get_key_value('llama.block_count')
+        metadata['llama.embedding_length'] = get_key_value('llama.embedding_length')
+        metadata['tokenizer.model'] = get_key_value('tokenizer.model')
+        metadata['general.file_type'] = get_key_value('general.file_type') # This might indicate quantization
 
         # Attempt to determine quantization from file type or name
         quantization = "Unknown"
