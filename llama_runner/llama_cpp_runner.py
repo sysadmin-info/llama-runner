@@ -25,10 +25,11 @@ class LlamaCppRunner:
         """
         self.model_name = model_name
         self.model_path = model_path
-        self.llama_cpp_runtime = llama_cpp_runtime
+        self.llama_cpp_runtime = llama_cpp_runtime or "llama-server"
         self.kwargs = kwargs
         self.process: subprocess.Popen = None
         self.startup_pattern = re.compile(r"main: server is listening on")  # Regex to detect startup
+        self.port = None #Dynamically assigned port
 
     async def start(self):
         """
@@ -83,8 +84,14 @@ class LlamaCppRunner:
                 break  # Process ended
 
             print(f"llama.cpp[{self.model_name}]: {line.strip()}")
-            if self.startup_pattern.search(line):
+            match = self.startup_pattern.search(line)
+            if match:
                 print(f"llama.cpp server for {self.model_name} started successfully.")
+                 # Extract port from the startup message
+                match = re.search(r'http://127\.0\.0\.1:(\d+)', line)
+                if match:
+                    self.port = int(match.group(1))
+                    print(f"llama.cpp server for {self.model_name} is listening on port {self.port}")
                 return True
             if self.process.poll() is not None:
                 print(f"llama.cpp server for {self.model_name} exited before startup.")
@@ -134,7 +141,7 @@ async def main():
 
     # Load model-specific config, if available
     model_config = config.get("models", {}).get(model_name, {})
-    llama_cpp_runtime = llama_runtimes.get(model_config.get("llama_cpp_runtime", "default"), "llama-server")
+    llama_cpp_runtime = llama_runtimes.get(model_config.get("llama_cpp_runtime", "default"), default_runtime)
 
     runner = LlamaCppRunner(
         model_name=model_name,
