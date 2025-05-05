@@ -20,3 +20,6 @@
     *   Modified `main.py` to initialize the PySide6 `QApplication` and the `MainWindow`.
     *   Refactored `main.py` to focus solely on launching the UI, removing direct runner/proxy startup logic from it. The UI components (`MainWindow` and its threads) are now responsible for managing these processes.
 6.  **History Tracking:** Created this `HISTORY.md` file to document the development steps.
+7.  **main.py Modification:**
+    *   Ensured `main.py` initializes and runs the PySide6 application, creating the `QApplication` and `MainWindow`.
+    *   The application starts the Qt event loop to display the UI.
