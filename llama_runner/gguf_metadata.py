@@ -257,6 +257,12 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                   quantization = get_scalar_metadata("quantization.method")
              elif get_scalar_metadata("quantization_version"): # Sometimes just a version number
                   quantization = f"Q{get_scalar_metadata('quantization_version')}"
+
+        # --- Remove "MOSTLY_" prefix if it exists ---
+        if isinstance(quantization, str) and quantization.startswith("MOSTLY_"):
+             quantization = quantization[len("MOSTLY_"):]
+        # --- End prefix removal ---
+
         # Ensure quantization is a string
         quantization = str(quantization) if quantization is not None else 'Unknown'
 
