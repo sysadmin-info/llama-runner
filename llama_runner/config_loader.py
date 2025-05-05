@@ -7,7 +7,7 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 LOG_FILE = os.path.join(CONFIG_DIR, "error.log")
 
 # Set up logging
-logging.basicConfig(filename=LOG_FILE, level=logging.ERROR, 
+logging.basicConfig(filename=LOG_FILE, level=logging.ERROR,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 def ensure_config_exists():
