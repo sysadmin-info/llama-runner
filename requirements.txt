@@ -4,4 +4,4 @@ uvicorn
 pyyaml
 gguf
 httpx
-asyncio-qt # Add asyncio-qt for bridging
+qasync
