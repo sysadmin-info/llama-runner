@@ -14,6 +14,7 @@ from typing import Dict, Any, Callable, List, Optional
 from fastapi import FastAPI, HTTPException, Request, Response, status # Import FastAPI and necessary components
 from fastapi.responses import JSONResponse, StreamingResponse # RedirectResponse is not needed if we proxy
 import httpx # Import httpx for forwarding requests
+import uvicorn
 
 from PySide6.QtCore import QThread, QObject, Signal, Slot, QTimer # Import QTimer for potential use
 
