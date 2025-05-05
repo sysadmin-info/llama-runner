@@ -7,7 +7,16 @@ import yaml
 import logging
 import traceback
 import time
-from typing import Optional, Dict, Any, Callable # Import Callable
+from typing import Optional, Dict, Any, Callable, List # Import Callable
+
+# Attempt to import asyncio_qt for bridging
+try:
+    from asyncio_qt import QEventLoop
+    ASYNCIO_QT_AVAILABLE = True
+    logging.debug("Successfully imported asyncio_qt. Using QEventLoop.")
+except ImportError:
+    logging.warning("The 'asyncio_qt' library is not installed. Asyncio-Qt bridging may not work correctly.")
+    ASYNCIO_QT_AVAILABLE = False
 
 from litellm.proxy.proxy_server import app # Keep import for potential future direct interaction if needed
 import uvicorn # Keep import if needed elsewhere, but proxy thread handles server
@@ -86,6 +95,8 @@ class LlamaRunnerThread(QThread):
         self._error_emitted = False # Reset flag
         try:
             # Use a new event loop for this thread
+            # Note: This thread runs its own asyncio loop. Bridging is needed
+            # to communicate with the main thread's Qt loop.
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
             self.loop.run_until_complete(self.run_async())
@@ -232,9 +243,11 @@ class ModelStatusWidget(QWidget):
 
 class MainWindow(QWidget):
     # Signal emitted when a runner's port is ready
-    runner_port_ready = Signal(str, int)
+    # This signal is emitted by MainWindow, connected to the proxy thread
+    runner_port_ready_for_proxy = Signal(str, int)
     # Signal emitted when a runner stops
-    runner_stopped = Signal(str)
+    # This signal is emitted by MainWindow, connected to the proxy thread
+    runner_stopped_for_proxy = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -269,6 +282,11 @@ class MainWindow(QWidget):
 
         self.llama_runner_threads: Dict[str, LlamaRunnerThread] = {}  # Dictionary to store threads for each model
         self.litellm_proxy_thread: Optional[LiteLLMProxyThread] = None
+
+        # Dictionary to hold asyncio Futures for runners that are starting
+        # Key: model_name, Value: asyncio.Future
+        self._runner_startup_futures: Dict[str, asyncio.Future] = {}
+
 
         self.layout = QVBoxLayout()
 
@@ -418,56 +436,72 @@ class MainWindow(QWidget):
              return thread.runner.get_port()
         return None
 
-    def request_runner_start(self, model_name: str):
+    def request_runner_start(self, model_name: str) -> asyncio.Future:
         """
         Initiates the process of starting a Llama runner for the given model.
         Handles concurrency limits. This method is a callback passed to the proxy thread.
-        It does NOT block and wait for the runner to start. The proxy thread
-        will need to listen for the runner_port_ready signal.
+        It returns an asyncio.Future that will be resolved when the runner is ready
+        or an exception occurs.
         """
         logging.info(f"Received request to start runner for model: {model_name}")
 
-        if model_name not in self.models:
-            logging.error(f"Request to start unknown model: {model_name}")
-            # TODO: Signal back to proxy that model is not configured?
-            return
+        # Check if a Future already exists for this model (meaning startup is in progress)
+        if model_name in self._runner_startup_futures and not self._runner_startup_futures[model_name].done():
+             logging.info(f"Runner for {model_name} is already starting. Returning existing Future.")
+             return self._runner_startup_futures[model_name]
 
-        # Check current running runners
+        # Check if the runner is already running
+        if self.is_llama_runner_running(model_name):
+             port = self.get_runner_port(model_name)
+             if port is not None:
+                 logging.info(f"Runner for {model_name} is already running on port {port}. Returning completed Future.")
+                 future = asyncio.Future()
+                 future.set_result(port)
+                 # Store completed future briefly to prevent duplicate starts if requests arrive rapidly
+                 self._runner_startup_futures[model_name] = future
+                 # Use a timer to remove the completed future after a short delay
+                 QTimer.singleShot(1000, lambda: self._cleanup_completed_future(model_name))
+                 return future
+             else:
+                 # Should not happen if is_llama_runner_running is True, but handle defensively
+                 logging.error(f"Runner for {model_name} is reported as running but port is None.")
+                 future = asyncio.Future()
+                 future.set_exception(RuntimeError(f"Runner for {model_name} is running but port is unavailable."))
+                 self._runner_startup_futures[model_name] = future
+                 QTimer.singleShot(1000, lambda: self._cleanup_completed_future(model_name))
+                 return future
+
+
+        # Check concurrent runner limit
         running_runners = {name: thread for name, thread in self.llama_runner_threads.items() if thread.isRunning()}
         num_running = len(running_runners)
 
-        # If the requested model is already running, do nothing
-        if model_name in running_runners:
-             logging.info(f"Llama Runner for {model_name} is already running. No action needed.")
-             # TODO: Signal back to proxy that it's already running and provide port?
-             # This might be handled by the proxy checking is_llama_runner_running and get_runner_port first.
-             return
-
-        # Check concurrent runner limit
         if num_running >= self.concurrent_runners_limit:
             if self.concurrent_runners_limit == 1:
                 logging.info(f"Concurrent runner limit ({self.concurrent_runners_limit}) reached. Stopping existing runner before starting {model_name}.")
                 # Stop the first running runner found (or all if limit is 1)
-                # We need to stop them and wait for them to actually stop.
-                # This waiting should ideally not block the UI thread or the proxy's async loop.
-                # A simple approach is to signal stop and let the proxy wait by checking status.
-                # Or, we can manage the stopping and waiting here and signal back when ready.
-                # Let's signal stop for all currently running runners. The proxy will need
-                # to poll or wait for the specific runner it wants to start.
-
                 # Signal stop for all currently running runners
                 for name_to_stop in list(running_runners.keys()):
                      self.stop_llama_runner(name_to_stop)
 
                 # The proxy thread will need to implement the waiting logic for the old runner(s)
                 # to stop and the new one to start. This method just initiates the stop/start process.
+                # We still create a Future for the *new* runner we are about to start.
 
             else:
                 logging.warning(f"Concurrent runner limit ({self.concurrent_runners_limit}) reached. Cannot start {model_name}.")
-                # TODO: Signal back to proxy that limit is reached?
-                return
+                future = asyncio.Future()
+                future.set_exception(RuntimeError(f"Concurrent runner limit ({self.concurrent_runners_limit}) reached. Cannot start '{model_name}'."))
+                # Store completed future briefly to prevent duplicate starts
+                self._runner_startup_futures[model_name] = future
+                QTimer.singleShot(1000, lambda: self._cleanup_completed_future(model_name))
+                return future
 
         # If we reached here, we are clear to start the requested runner (either limit allows, or old ones were signaled to stop)
+
+        # Create a new Future for this startup request
+        future = asyncio.Future()
+        self._runner_startup_futures[model_name] = future
 
         model_config = self.models[model_name]
         model_path = model_config.get("model_path")
@@ -476,20 +510,20 @@ class MainWindow(QWidget):
 
         if not model_path:
              logging.error(f"Configuration Error: Model '{model_name}' has no 'model_path' specified in config.json.")
-             # TODO: Signal back to proxy about config error?
-             return
+             future.set_exception(RuntimeError(f"Configuration Error: Model '{model_name}' has no 'model_path'."))
+             return future
 
         # Check if the model file exists
         if not os.path.exists(model_path):
              logging.error(f"File Not Found: Model file not found: {model_path}")
-             # TODO: Signal back to proxy about file not found?
-             return
+             future.set_exception(FileNotFoundError(f"Model file not found: {model_path}"))
+             return future
 
         # Check if the runtime executable exists if it's not the default "llama-server" (which is expected in PATH)
         if llama_cpp_runtime_key != "default" and not os.path.exists(llama_cpp_runtime):
              logging.error(f"Runtime Not Found: Llama.cpp runtime not found: {llama_cpp_runtime}")
-             # TODO: Signal back to proxy about runtime not found?
-             return
+             future.set_exception(FileNotFoundError(f"Llama.cpp runtime not found: {llama_cpp_runtime}"))
+             return future
 
 
         print(f"Starting Llama Runner for {model_name}...")
@@ -515,8 +549,14 @@ class MainWindow(QWidget):
         self.llama_runner_threads[model_name] = thread
         thread.start()
 
-        # This method returns immediately. The proxy thread needs to wait for the
-        # runner_port_ready signal for this model_name.
+        # Return the Future that will be resolved when the runner is ready
+        return future
+
+    def _cleanup_completed_future(self, model_name: str):
+        """Helper to remove a completed future from the dictionary after a delay."""
+        if model_name in self._runner_startup_futures and self._runner_startup_futures[model_name].done():
+             logging.debug(f"Cleaning up completed future for {model_name}")
+             del self._runner_startup_futures[model_name]
 
 
     def stop_llama_runner(self, model_name: str):
@@ -585,6 +625,11 @@ class MainWindow(QWidget):
         # self.litellm_proxy_thread.stopped.connect(self.on_litellm_proxy_stopped)
         # self.litellm_proxy_thread.error.connect(self.on_litellm_proxy_error)
 
+        # Connect MainWindow signals to proxy thread slots for bridging
+        self.runner_port_ready_for_proxy.connect(self.litellm_proxy_thread.on_runner_port_ready)
+        self.runner_stopped_for_proxy.connect(self.litellm_proxy_thread.on_runner_stopped)
+
+
         self.litellm_proxy_thread.start()
 
 
@@ -643,7 +688,13 @@ class MainWindow(QWidget):
                 status_widget.set_buttons_enabled(True, False) # Enable start, disable stop
 
             # Emit signal for the proxy thread
-            self.runner_stopped.emit(model_name)
+            self.runner_stopped_for_proxy.emit(model_name)
+
+            # If there's a pending Future for this runner, set an exception
+            if model_name in self._runner_startup_futures and not self._runner_startup_futures[model_name].done():
+                 logging.debug(f"Runner {model_name} stopped unexpectedly while startup Future was pending.")
+                 self._runner_startup_futures[model_name].set_exception(RuntimeError(f"Runner for {model_name} stopped unexpectedly during startup."))
+                 # The future will be cleaned up by _cleanup_completed_future after a delay
 
         else:
             print(f"Stopped signal received for unknown or already cleaned up model: {model_name}")
@@ -673,13 +724,19 @@ class MainWindow(QWidget):
             status_widget.update_status("Error")
             # The stopped signal will follow and update the status to "Not Running" and re-enable the start button
 
+        # If there's a pending Future for this runner, set an exception
+        if model_name in self._runner_startup_futures and not self._runner_startup_futures[model_name].done():
+             logging.debug(f"Runner {model_name} errored while startup Future was pending.")
+             self._runner_startup_futures[model_name].set_exception(RuntimeError(f"Runner for {model_name} errored during startup: {message}"))
+             # The future will be cleaned up by _cleanup_completed_future after a delay
+
 
     @Slot(str, int) # Slot receives model_name and port
     def on_llama_runner_port_ready_and_emit(self, model_name: str, port: int):
         """
         Slot to handle the LlamaCppRunner port ready signal.
         Updates the UI with the assigned port and status.
-        Also emits a signal from MainWindow for the proxy thread.
+        Also resolves the corresponding Future and emits a signal for the proxy thread.
         """
         print(f"Llama Runner for {model_name} ready on port {port}.")
         status_widget = self.model_status_widgets.get(model_name)
@@ -688,8 +745,19 @@ class MainWindow(QWidget):
             status_widget.update_status("Running")
             status_widget.set_buttons_enabled(False, True) # Disable start, enable stop
 
+        # Resolve the corresponding Future
+        if model_name in self._runner_startup_futures and not self._runner_startup_futures[model_name].done():
+             logging.debug(f"Resolving runner_startup_future for {model_name} with port {port}")
+             self._runner_startup_futures[model_name].set_result(port)
+             # The future will be cleaned up by _cleanup_completed_future after a delay
+        elif model_name in self._runner_startup_futures and self._runner_startup_futures[model_name].done():
+             logging.warning(f"Runner_port_ready signal received for {model_name}, but Future was already done.")
+        else:
+             logging.warning(f"Runner_port_ready signal received for {model_name}, but no pending Future found.")
+
+
         # Emit signal for the proxy thread
-        self.runner_port_ready.emit(model_name, port)
+        self.runner_port_ready_for_proxy.emit(model_name, port)
 
 
     # Optional: Slots for proxy thread signals if added later
