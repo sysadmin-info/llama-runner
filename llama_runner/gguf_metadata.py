@@ -37,38 +37,35 @@ def ensure_cache_dir_exists():
     Path(METADATA_CACHE_DIR).mkdir(parents=True, exist_ok=True)
     logging.info(f"Ensured metadata cache directory exists: {METADATA_CACHE_DIR}")
 
-def calculate_file_hash(filepath: str) -> str:
-    """Calculates the SHA256 hash of a file."""
-    hasher = hashlib.sha256()
+# Renamed from calculate_file_hash to get_file_size
+def get_file_size(filepath: str) -> Optional[int]:
+    """Gets the size of a file in bytes."""
     try:
-        with open(filepath, 'rb') as f:
-            # Read the file in chunks to avoid large memory usage
-            while chunk := f.read(4096):
-                hasher.update(chunk)
-        return hasher.hexdigest()
+        return os.path.getsize(filepath)
     except FileNotFoundError:
-        logging.error(f"File not found for hashing: {filepath}")
-        return ""
+        logging.error(f"File not found for size check: {filepath}")
+        return None
     except Exception as e:
-        # Add traceback to hashing error logging
-        logging.error(f"Error calculating hash for {filepath}: {e}\n{traceback.format_exc()}")
-        return ""
+        logging.error(f"Error getting size for {filepath}: {e}\n{traceback.format_exc()}")
+        return None
 
-def get_metadata_cache_path(model_name: str, file_hash: str) -> str:
-    """Generates a cache file path based on model name and file hash."""
+# Updated to use file_size instead of file_hash
+def get_metadata_cache_path(model_name: str, file_size: int) -> str:
+    """Generates a cache file path based on model name and file size."""
     # Sanitize model name for filename
     safe_model_name = "".join(c if c.isalnum() or c in (' ', '.', '-') else '_' for c in model_name).replace(' ', '_')
-    # Use a portion of the hash to keep filenames shorter but still unique per file version
-    return os.path.join(METADATA_CACHE_DIR, f"{safe_model_name}_{file_hash[:8]}.json")
+    # Use file size in the filename
+    return os.path.join(METADATA_CACHE_DIR, f"{safe_model_name}_{file_size}.json")
 
-def load_metadata_from_cache(model_name: str, file_hash: str) -> Optional[Dict[str, Any]]:
+# Updated to use file_size instead of file_hash
+def load_metadata_from_cache(model_name: str, file_size: int) -> Optional[Dict[str, Any]]:
     """Loads metadata from the cache file if it exists and is valid."""
-    cache_path = get_metadata_cache_path(model_name, file_hash)
+    cache_path = get_metadata_cache_path(model_name, file_size)
     if os.path.exists(cache_path):
         try:
             with open(cache_path, 'r') as f:
                 metadata = json.load(f)
-            logging.info(f"Loaded metadata from cache for {model_name}")
+            logging.info(f"Loaded metadata from cache for {model_name} (size: {file_size})")
             return metadata
         except json.JSONDecodeError as e:
             logging.error(f"Error decoding JSON from cache file {cache_path}: {e}")
@@ -79,13 +76,14 @@ def load_metadata_from_cache(model_name: str, file_hash: str) -> Optional[Dict[s
             return None
     return None
 
-def save_metadata_to_cache(model_name: str, file_hash: str, metadata: Dict[str, Any]):
+# Updated to use file_size instead of file_hash
+def save_metadata_to_cache(model_name: str, file_size: int, metadata: Dict[str, Any]):
     """Saves metadata to a cache file."""
-    cache_path = get_metadata_cache_path(model_name, file_hash)
+    cache_path = get_metadata_cache_path(model_name, file_size)
     try:
         with open(cache_path, 'w') as f:
             json.dump(metadata, f, indent=2)
-        logging.info(f"Saved metadata to cache for {model_name} at {cache_path}")
+        logging.info(f"Saved metadata to cache for {model_name} (size: {file_size}) at {cache_path}")
     except Exception as e:
         logging.error(f"Error saving metadata to cache {cache_path}: {e}")
 
@@ -127,6 +125,7 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                  metadata[key] = None
 
         # Helper to safely get a scalar value from metadata, handling lists/tuples/arrays
+        # Returns the raw scalar value, does not force string conversion
         def get_scalar_metadata(key: str, default: Any = None) -> Any:
             value = metadata.get(key)
 
@@ -164,16 +163,16 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
             if value is None:
                  return default
             else:
-                # Return the value directly if it's not a list/tuple/array (after unwrapping)
+                # Return the raw value if it's not a list/tuple/array (after unwrapping)
                 return value
 
 
         # --- Construct LM Studio format based on requested fields ---
 
         # id: general.name (fallback to filename)
-        model_id = get_scalar_metadata('general.name', os.path.basename(model_path))
+        model_id_val = get_scalar_metadata('general.name', os.path.basename(model_path))
         # Ensure ID is a string
-        model_id = str(model_id) if model_id is not None else os.path.basename(model_path)
+        model_id = str(model_id_val) if model_id_val is not None else os.path.basename(model_path)
 
 
         # object: "model" (static)
@@ -182,10 +181,10 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         # type: "llm", "vlm", "embeddings" (detected)
         # Check metadata keys first
         model_type = "llm" # Default to llm
-        ggml_model_type = get_scalar_metadata("ggml.model.type")
-        if ggml_model_type and isinstance(ggml_model_type, str) and ggml_model_type.lower() == "embedding":
+        ggml_model_type_val = get_scalar_metadata("ggml.model.type")
+        if ggml_model_type_val is not None and isinstance(ggml_model_type_val, str) and ggml_model_type_val.lower() == "embedding":
              model_type = "embeddings"
-        elif ggml_model_type and isinstance(ggml_model_type, str) and ggml_model_type.lower() == "vlm":
+        elif ggml_model_type_val is not None and isinstance(ggml_model_type_val, str) and ggml_model_type_val.lower() == "vlm":
              model_type = "vlm"
         # Fallback to filename heuristic if metadata key is missing
         elif "embedding" in os.path.basename(model_path).lower() or "embed" in os.path.basename(model_path).lower():
@@ -195,15 +194,15 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
 
 
         # publisher: general.quantized_by (fallback to general.url, then local)
-        publisher = get_scalar_metadata('general.quantized_by', get_scalar_metadata('general.url', 'local'))
+        publisher_val = get_scalar_metadata('general.quantized_by', get_scalar_metadata('general.url', 'local'))
         # Ensure publisher is a string
-        publisher = str(publisher) if publisher is not None else 'local'
+        publisher = str(publisher_val) if publisher_val is not None else 'local'
 
 
         # arch: general.architecture (fallback to unknown)
-        architecture = get_scalar_metadata('general.architecture', 'unknown')
+        architecture_val = get_scalar_metadata('general.architecture', 'unknown')
         # Ensure architecture is a string
-        architecture = str(architecture) if architecture is not None else 'unknown'
+        architecture = str(architecture_val) if architecture_val is not None else 'unknown'
 
 
         # compatibility_type: "gguf" (static)
@@ -211,17 +210,12 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
 
         # quantization: GGMLQuantizationType(general.file_type).name (fallback to heuristic)
         quantization = "Unknown"
-        file_type_val = get_scalar_metadata('general.file_type') # Use the helper
+        file_type_val = get_scalar_metadata('general.file_type') # Use the helper to get the raw value
         if GGUF_AVAILABLE and file_type_val is not None:
             try:
-                # Attempt to use the enum name
-                # Ensure file_type_val is an integer if it came from metadata
-                if isinstance(file_type_val, str): # It might be a string if get_scalar_metadata converted it
-                    try:
-                        file_type_int = int(file_type_val)
-                    except (ValueError, TypeError):
-                        logging.warning(f"'general.file_type' is a non-integer string ('{file_type_val}') in {model_path}. Value: {file_type_val}")
-                        file_type_int = None # Fall through to heuristic
+                # Attempt to convert file_type_val to an integer
+                if isinstance(file_type_val, str):
+                    file_type_int = int(file_type_val)
                 elif isinstance(file_type_val, int):
                     file_type_int = file_type_val
                 else:
@@ -229,6 +223,7 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                     file_type_int = None # Fall through to heuristic
 
                 if file_type_int is not None:
+                    # Use the integer value to get the enum name
                     quantization = GGMLQuantizationType(file_type_int).name
                 # else: fall through to heuristic
 
@@ -318,29 +313,30 @@ def get_model_lmstudio_format(model_name: str, model_path: str, is_running: bool
             "max_context_length": 4096 # Default if no metadata
         }
 
-    file_hash = calculate_file_hash(model_path)
-    if not file_hash:
-        logging.error(f"Could not get hash for {model_path}. Cannot use cache.")
-        # Fallback to extracting without caching if hashing fails
+    # Use file size for caching
+    file_size = get_file_size(model_path)
+    if file_size is None:
+        logging.error(f"Could not get size for {model_path}. Cannot use cache.")
+        # Fallback to extracting without caching if size retrieval fails
         metadata = extract_gguf_metadata(model_path)
         if metadata:
              metadata["state"] = "loaded" if is_running else "not-loaded"
         return metadata
 
 
-    cached_metadata = load_metadata_from_cache(model_name, file_hash)
+    cached_metadata = load_metadata_from_cache(model_name, file_size)
 
     if cached_metadata:
         # Update the state based on current runtime status
         cached_metadata["state"] = "loaded" if is_running else "not-loaded"
         return cached_metadata
     else:
-        logging.info(f"Cache miss or invalid for {model_name}. Extracting metadata...")
+        logging.info(f"Cache miss or invalid for {model_name} (size: {file_size}). Extracting metadata...")
         extracted_metadata = extract_gguf_metadata(model_path)
         if extracted_metadata:
             # Add state and save to cache
             extracted_metadata["state"] = "loaded" if is_running else "not-loaded"
-            save_metadata_to_cache(model_name, file_hash, extracted_metadata)
+            save_metadata_to_cache(model_name, file_size, extracted_metadata)
             return extracted_metadata
         else:
             logging.error(f"Failed to extract metadata for {model_name} at {model_path}")
