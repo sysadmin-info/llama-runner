@@ -5,13 +5,18 @@ import logging
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
-# Attempt to import the gguf library
+# Attempt to import the gguf library and specific components
 try:
     from gguf import GGUFReader
+    from gguf.gguf_reader import GGMLQuantizationType # Import the quantization enum
     GGUF_AVAILABLE = True
 except ImportError:
-    logging.warning("The 'gguf' library is not installed. Metadata extraction will be disabled.")
+    logging.warning("The 'gguf' library is not installed or GGMLQuantizationType is missing. Metadata extraction will be disabled.")
     GGUF_AVAILABLE = False
+except Exception as e:
+    logging.warning(f"Error importing gguf components: {e}. Metadata extraction may be limited.")
+    GGUF_AVAILABLE = False # Treat as unavailable if import fails unexpectedly
+
 
 from llama_runner.config_loader import CONFIG_DIR # Assuming CONFIG_DIR is defined here
 
@@ -99,34 +104,17 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                 metadata[key] = None # Store None or skip? Store None for now.
 
 
-        # Attempt to determine quantization from file type or name
-        quantization = "Unknown"
-        file_type = metadata.get('general.file_type')
-        if file_type is not None:
-             # Map GGUF file_type integer to string representation (based on gguf.py)
-             # This mapping might need refinement based on actual gguf library values
-             # Using a simplified map for common types, as the full map is large
-             file_type_map = {
-                 0: "f32", 1: "f16", 2: "q4_0", 3: "q4_1",
-                 5: "q8_0", 6: "q5_0", 7: "q5_1", 8: "q2_k", 9: "q3_k_s",
-                 10: "q3_k_m", 11: "q3_k_l", 12: "q4_k_s", 13: "q4_k_m",
-                 14: "q5_k_s", 15: "q5_k_m", 16: "q6_k", 17: "q8_k",
-                 24: "bf16",
-                 # Add more mappings if needed based on gguf.py source
-             }
-             quantization = file_type_map.get(file_type, f"Type_{file_type}")
-        elif "q4_k_m" in os.path.basename(model_path).lower():
-             quantization = "Q4_K_M" # Common convention
-        # Fallback: Check if quantization info is directly in metadata keys (e.g., "quantization.method")
-        elif metadata.get("quantization.method"):
-             quantization = metadata["quantization.method"]
-        elif metadata.get("quantization_version"): # Sometimes just a version number
-             quantization = f"Q{metadata['quantization_version']}"
+        # --- Construct LM Studio format based on requested fields ---
 
+        # id: general.name (fallback to filename)
+        model_id = metadata.get('general.name', os.path.basename(model_path))
 
-        # Attempt to determine type (llm, vlm, embeddings)
-        model_type = "llm" # Default to llm
+        # object: "model" (static)
+        obj_type = "model" # Static value as per LM Studio API
+
+        # type: "llm", "vlm", "embeddings" (detected)
         # Check metadata keys first
+        model_type = "llm" # Default to llm
         if metadata.get("ggml.model.type") == "embedding":
              model_type = "embeddings"
         elif metadata.get("ggml.model.type") == "vlm":
@@ -138,17 +126,65 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         # For now, stick to llm/embeddings based on metadata/filename heuristic
 
 
-        # Construct LM Studio format
+        # publisher: general.quantized_by (fallback to general.url, then local)
+        publisher = metadata.get('general.quantized_by', metadata.get('general.url', 'local'))
+
+        # arch: general.architecture (fallback to unknown)
+        architecture = metadata.get('general.architecture', 'unknown')
+
+        # compatibility_type: "gguf" (static)
+        compatibility_type = "gguf" # Static value
+
+        # quantization: GGMLQuantizationType(general.file_type).name (fallback to heuristic)
+        quantization = "Unknown"
+        file_type = metadata.get('general.file_type')
+        if GGUF_AVAILABLE and file_type is not None:
+            try:
+                # Attempt to use the enum name
+                quantization = GGMLQuantizationType(file_type).name
+            except ValueError:
+                logging.warning(f"Unknown GGMLQuantizationType value: {file_type} for {model_path}")
+                quantization = f"Type_{file_type}" # Fallback if enum value is unknown
+            except Exception as e:
+                 logging.warning(f"Error getting quantization name from enum for {model_path}: {e}")
+                 # Fall through to heuristic
+        # Fallback to heuristic if enum method fails or is not available
+        if quantization == "Unknown":
+             if "q4_k_m" in os.path.basename(model_path).lower():
+                  quantization = "Q4_K_M" # Common convention
+             # Fallback: Check if quantization info is directly in metadata keys (e.g., "quantization.method")
+             elif metadata.get("quantization.method"):
+                  quantization = metadata["quantization.method"]
+             elif metadata.get("quantization_version"): # Sometimes just a version number
+                  quantization = f"Q{metadata['quantization_version']}"
+
+
+        # max_context_length: ${general.architecture}.context_length (fallback to common keys, then default)
+        max_ctx = 4096 # Default value
+        if architecture != 'unknown':
+             # Try the architecture-specific key
+             ctx_key = f'{architecture}.context_length'
+             max_ctx = metadata.get(ctx_key, max_ctx)
+
+        # If architecture-specific key wasn't found or architecture was unknown, check common keys
+        if max_ctx == 4096 and architecture == 'unknown': # Only check common keys if default is still used and arch is unknown
+             max_ctx = metadata.get('llama.context_length', max_ctx)
+             max_ctx = metadata.get('phi3.context_length', max_ctx)
+             max_ctx = metadata.get('qwen2.context_length', max_ctx)
+             # Add other common architecture keys here if needed
+
+
+        # Construct the final LM Studio format dictionary
         lmstudio_format = {
-            "id": metadata.get('general.name', os.path.basename(model_path)), # Use GGUF name or filename
-            "object": "model",
+            "id": model_id,
+            "object": obj_type,
             "type": model_type,
-            "publisher": metadata.get('general.url', 'local'), # Use URL if available, else local
-            "arch": metadata.get('general.architecture', 'unknown'),
-            "compatibility_type": "gguf", # Assuming all are gguf
+            "publisher": publisher,
+            "arch": architecture,
+            "compatibility_type": compatibility_type,
             "quantization": quantization,
             # State will be added later based on runtime status
-            "max_context_length": metadata.get('llama.context_length', metadata.get('phi3.context_length', metadata.get('qwen2.context_length', 4096))) # Check common keys, default if not found
+            "max_context_length": max_ctx
         }
 
         logging.info(f"Successfully extracted metadata for {model_path}")
@@ -164,6 +200,7 @@ def get_model_lmstudio_format(model_name: str, model_path: str, is_running: bool
     Includes the current running state.
     """
     if not GGUF_AVAILABLE:
+        # Return a minimal structure if GGUF library is not available
         return {
             "id": model_name,
             "object": "model",
