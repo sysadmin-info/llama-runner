@@ -7,7 +7,7 @@ import yaml
 import logging
 import traceback
 import time
-from typing import Optional # Import Optional
+from typing import Optional, Dict, Any, Callable # Import Callable
 
 from litellm.proxy.proxy_server import app # Keep import for potential future direct interaction if needed
 import uvicorn # Keep import if needed elsewhere, but proxy thread handles server
@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                                QPushButton, QLineEdit, QTabWidget, QMessageBox,
                                QDialog, QTextEdit, QDialogButtonBox, QListWidget,
                                QStackedWidget, QSizePolicy, QSpacerItem)
-from PySide6.QtCore import QThread, QObject, Signal, Slot, Qt
+from PySide6.QtCore import QThread, QObject, Signal, Slot, Qt, QTimer # Import QTimer
 
 from llama_runner.config_loader import load_config
 from llama_runner.llama_cpp_runner import LlamaCppRunner
@@ -24,7 +24,8 @@ from llama_runner.lite_llm_proxy_thread import LiteLLMProxyThread # Import the p
 from llama_runner import gguf_metadata # Import the new metadata module
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Note: basicConfig is now handled in main.py for configurable levels
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class ErrorOutputDialog(QDialog):
     """
@@ -65,7 +66,7 @@ class LlamaRunnerThread(QThread):
     started = Signal()
     stopped = Signal()
     error = Signal(str, list) # Signal includes error message and output buffer
-    port_ready = Signal(int)
+    port_ready = Signal(str, int) # Signal includes model_name and port
 
     def __init__(self, model_name: str, model_path: str, llama_cpp_runtime: str = None, **kwargs):
         super().__init__()
@@ -124,7 +125,8 @@ class LlamaRunnerThread(QThread):
                  raise RuntimeError("Llama.cpp server failed to start or extract port.")
 
             self.started.emit()
-            self.port_ready.emit(self.runner.get_port()) # Emit the port number
+            # Emit model_name along with the port number
+            self.port_ready.emit(self.model_name, self.runner.get_port())
 
             # Keep the runner alive until the thread is stopped or process exits
             while self.is_running and self.runner.is_running():
@@ -229,6 +231,11 @@ class ModelStatusWidget(QWidget):
 
 
 class MainWindow(QWidget):
+    # Signal emitted when a runner's port is ready
+    runner_port_ready = Signal(str, int)
+    # Signal emitted when a runner stops
+    runner_stopped = Signal(str)
+
     def __init__(self):
         super().__init__()
 
@@ -260,8 +267,8 @@ class MainWindow(QWidget):
                  logging.warning(f"Model '{model_name}' has no 'model_path' in config. Skipping metadata caching.")
 
 
-        self.llama_runner_threads = {}  # Dictionary to store threads for each model
-        self.litellm_proxy_thread = None
+        self.llama_runner_threads: Dict[str, LlamaRunnerThread] = {}  # Dictionary to store threads for each model
+        self.litellm_proxy_thread: Optional[LiteLLMProxyThread] = None
 
         self.layout = QVBoxLayout()
 
@@ -280,7 +287,7 @@ class MainWindow(QWidget):
         self.model_status_stack = QStackedWidget()
         self.llama_layout.addWidget(self.model_status_stack)
 
-        self.model_status_widgets = {} # Store status widgets by model name
+        self.model_status_widgets: Dict[str, ModelStatusWidget] = {} # Store status widgets by model name
 
         # Populate model list and create status widgets
         for model_name in self.models.keys():
@@ -319,11 +326,12 @@ class MainWindow(QWidget):
         self.litellm_layout.addWidget(QLabel("LiteLLM Proxy Status:"))
         self.litellm_status_label = QLabel("Not Running")
         self.litellm_layout.addWidget(self.litellm_status_label)
-        self.litellm_start_button = QPushButton("Start LiteLLM Proxy")
-        self.litellm_stop_button = QPushButton("Stop LiteLLM Proxy")
-        self.litellm_stop_button.setEnabled(False) # Initially disabled
-        self.litellm_layout.addWidget(self.litellm_start_button)
-        self.litellm_layout.addWidget(self.litellm_stop_button)
+        # Remove start/stop buttons for proxy, it starts automatically
+        # self.litellm_start_button = QPushButton("Start LiteLLM Proxy")
+        # self.litellm_stop_button = QPushButton("Stop LiteLLM Proxy")
+        # self.litellm_stop_button.setEnabled(False) # Initially disabled
+        # self.litellm_layout.addWidget(self.litellm_start_button)
+        # self.litellm_layout.addWidget(self.litellm_stop_button)
         self.litellm_layout.addStretch()
         self.litellm_tab.setLayout(self.litellm_layout)
         self.tabs.addTab(self.litellm_tab, "LiteLLM Proxy")
@@ -331,12 +339,16 @@ class MainWindow(QWidget):
         self.layout.addWidget(self.tabs)
         self.setLayout(self.layout)
 
-        # Connect buttons to actions
-        self.litellm_start_button.clicked.connect(self.start_litellm_proxy)
-        self.litellm_stop_button.clicked.connect(self.stop_litellm_proxy)
+        # Connect buttons to actions (removed proxy buttons)
+        # self.litellm_start_button.clicked.connect(self.start_litellm_proxy)
+        # self.litellm_stop_button.clicked.connect(self.stop_litellm_proxy)
 
         # Connect signals from LlamaRunnerThreads (will be connected when threads are created)
         # We need to connect these signals dynamically when a thread is started.
+
+        # --- Start the LiteLLM Proxy automatically ---
+        self.start_litellm_proxy()
+        # --- End automatic proxy start ---
 
 
     def closeEvent(self, event):
@@ -381,6 +393,7 @@ class MainWindow(QWidget):
         """
         Checks if the Llama runner thread for a given model is currently running
         and if the underlying process is also running.
+        This method is a callback passed to the proxy thread.
         """
         thread = self.llama_runner_threads.get(model_name)
         if thread and thread.isRunning():
@@ -394,24 +407,29 @@ class MainWindow(QWidget):
                  return False
         return False
 
-    def get_running_llama_runner_info(self) -> Optional[tuple[str, int]]:
+    def get_runner_port(self, model_name: str) -> Optional[int]:
         """
-        Finds the name and port of the first currently running Llama runner.
-        Returns (model_name, port) or None if no runner is running.
+        Gets the port of a running Llama runner.
+        This method is a callback passed to the proxy thread.
+        Returns the port number or None if the runner is not running or port is not available.
         """
-        for model_name, thread in list(self.llama_runner_threads.items()):
-            if thread.isRunning() and thread.runner and thread.runner.is_running() and thread.runner.get_port() is not None:
-                return (model_name, thread.runner.get_port())
+        thread = self.llama_runner_threads.get(model_name)
+        if thread and thread.isRunning() and thread.runner and thread.runner.is_running():
+             return thread.runner.get_port()
         return None
 
+    def request_runner_start(self, model_name: str):
+        """
+        Initiates the process of starting a Llama runner for the given model.
+        Handles concurrency limits. This method is a callback passed to the proxy thread.
+        It does NOT block and wait for the runner to start. The proxy thread
+        will need to listen for the runner_port_ready signal.
+        """
+        logging.info(f"Received request to start runner for model: {model_name}")
 
-    def start_llama_runner(self, model_name: str):
-        """
-        Starts the LlamaCppRunner for a specific model in a separate thread.
-        Handles concurrent runner limit and waits for previous runners to stop.
-        """
         if model_name not in self.models:
-            print(f"Model {model_name} not found in config.")
+            logging.error(f"Request to start unknown model: {model_name}")
+            # TODO: Signal back to proxy that model is not configured?
             return
 
         # Check current running runners
@@ -420,44 +438,36 @@ class MainWindow(QWidget):
 
         # If the requested model is already running, do nothing
         if model_name in running_runners:
-             print(f"Llama Runner for {model_name} is already running.")
+             logging.info(f"Llama Runner for {model_name} is already running. No action needed.")
+             # TODO: Signal back to proxy that it's already running and provide port?
+             # This might be handled by the proxy checking is_llama_runner_running and get_runner_port first.
              return
 
         # Check concurrent runner limit
         if num_running >= self.concurrent_runners_limit:
             if self.concurrent_runners_limit == 1:
-                print(f"Concurrent runner limit ({self.concurrent_runners_limit}) reached. Stopping existing runner before starting {model_name}.")
+                logging.info(f"Concurrent runner limit ({self.concurrent_runners_limit}) reached. Stopping existing runner before starting {model_name}.")
                 # Stop the first running runner found (or all if limit is 1)
-                stopped_successfully = True
-                for name_to_stop, thread_to_stop in list(running_runners.items()):
+                # We need to stop them and wait for them to actually stop.
+                # This waiting should ideally not block the UI thread or the proxy's async loop.
+                # A simple approach is to signal stop and let the proxy wait by checking status.
+                # Or, we can manage the stopping and waiting here and signal back when ready.
+                # Let's signal stop for all currently running runners. The proxy will need
+                # to poll or wait for the specific runner it wants to start.
+
+                # Signal stop for all currently running runners
+                for name_to_stop in list(running_runners.keys()):
                      self.stop_llama_runner(name_to_stop)
-                     # Wait for the thread to actually stop
-                     timeout_seconds = 15
-                     start_time = time.time()
-                     # Wait until the thread is no longer running or timeout
-                     while thread_to_stop.isRunning() and (time.time() - start_time) < timeout_seconds:
-                         QApplication.processEvents() # Keep UI responsive
-                         time.sleep(0.1) # Wait a bit
 
-                     if thread_to_stop.isRunning():
-                         print(f"Error: Llama Runner for {name_to_stop} did not stop within {timeout_seconds} seconds.")
-                         QMessageBox.critical(self, "Stop Error",
-                                              f"Failed to stop existing runner for '{name_to_stop}' within {timeout_seconds} seconds. Cannot start new runner.")
-                         stopped_successfully = False
-                         # Don't try to stop others, just report the failure and exit
-                         break
-                     else:
-                         print(f"Llama Runner for {name_to_stop} stopped successfully.")
-
-                if not stopped_successfully:
-                     return # Exit if any runner failed to stop
+                # The proxy thread will need to implement the waiting logic for the old runner(s)
+                # to stop and the new one to start. This method just initiates the stop/start process.
 
             else:
-                print(f"Concurrent runner limit ({self.concurrent_runners_limit}) reached. Cannot start {model_name}.")
-                QMessageBox.warning(self, "Concurrent Runner Limit",
-                                    f"Concurrent runner limit ({self.concurrent_runners_limit}) reached. Cannot start '{model_name}'.")
+                logging.warning(f"Concurrent runner limit ({self.concurrent_runners_limit}) reached. Cannot start {model_name}.")
+                # TODO: Signal back to proxy that limit is reached?
                 return
 
+        # If we reached here, we are clear to start the requested runner (either limit allows, or old ones were signaled to stop)
 
         model_config = self.models[model_name]
         model_path = model_config.get("model_path")
@@ -465,17 +475,20 @@ class MainWindow(QWidget):
         llama_cpp_runtime = self.llama_runtimes.get(llama_cpp_runtime_key, self.default_runtime)
 
         if not model_path:
-             QMessageBox.critical(self, "Configuration Error", f"Model '{model_name}' has no 'model_path' specified in config.json.")
+             logging.error(f"Configuration Error: Model '{model_name}' has no 'model_path' specified in config.json.")
+             # TODO: Signal back to proxy about config error?
              return
 
         # Check if the model file exists
         if not os.path.exists(model_path):
-             QMessageBox.critical(self, "File Not Found", f"Model file not found: {model_path}")
+             logging.error(f"File Not Found: Model file not found: {model_path}")
+             # TODO: Signal back to proxy about file not found?
              return
 
         # Check if the runtime executable exists if it's not the default "llama-server" (which is expected in PATH)
         if llama_cpp_runtime_key != "default" and not os.path.exists(llama_cpp_runtime):
-             QMessageBox.critical(self, "Runtime Not Found", f"Llama.cpp runtime not found: {llama_cpp_runtime}")
+             logging.error(f"Runtime Not Found: Llama.cpp runtime not found: {llama_cpp_runtime}")
+             # TODO: Signal back to proxy about runtime not found?
              return
 
 
@@ -496,10 +509,14 @@ class MainWindow(QWidget):
         thread.started.connect(lambda: self.on_llama_runner_started(model_name))
         thread.stopped.connect(lambda: self.on_llama_runner_stopped(model_name))
         thread.error.connect(lambda msg, output: self.on_llama_runner_error(model_name, msg, output))
-        thread.port_ready.connect(lambda port: self.on_llama_runner_port_ready(model_name, port))
+        # Connect the port_ready signal to a slot that emits the MainWindow's signal
+        thread.port_ready.connect(self.on_llama_runner_port_ready_and_emit)
 
         self.llama_runner_threads[model_name] = thread
         thread.start()
+
+        # This method returns immediately. The proxy thread needs to wait for the
+        # runner_port_ready signal for this model_name.
 
 
     def stop_llama_runner(self, model_name: str):
@@ -542,56 +559,44 @@ class MainWindow(QWidget):
     def start_litellm_proxy(self):
         """
         Starts the LiteLLM proxy in a separate thread.
+        This is now called automatically in __init__.
         """
         if self.litellm_proxy_thread is not None and self.litellm_proxy_thread.isRunning():
             print("LiteLLM Proxy is already running.")
             return
 
-        # Find the first running Llama Runner to connect the proxy to
-        running_runner_info = self.get_running_llama_runner_info()
-
-        # Note: The LiteLLM proxy's /v1 endpoints will only work if a runner is active
-        # and its port is passed here. The /v0/models endpoint will work regardless.
-        # We allow starting the proxy even without an active runner, but warn the user.
-        active_model_name = None
-        active_model_port = None
-        if running_runner_info:
-             active_model_name, active_model_port = running_runner_info
-             print(f"Starting LiteLLM Proxy, connecting to active model '{active_model_name}' on port {active_model_port}...")
-        else:
-             print("No Llama Runner is currently running. Starting LiteLLM Proxy without an active model configured.")
-             QMessageBox.information(self, "LiteLLM Proxy", "No Llama Runner is currently running. The LiteLLM proxy will start, but chat/completion endpoints will not work until a model is started.")
-
-
+        print("Starting LiteLLM Proxy...")
         self.litellm_status_label.setText("Running...")
-        self.litellm_start_button.setEnabled(False)
-        self.litellm_stop_button.setEnabled(True)
+        # Proxy buttons are removed, status label is enough
 
-        # Get the optional API key from the config
         proxy_api_key = self.litellm_proxy_config.get("api_key")
 
-        # Pass models config and the running status callback to the proxy thread
-        # Also pass the active model info for the LiteLLM model_list config
+        # Pass models config and the necessary callback methods to the proxy thread
         self.litellm_proxy_thread = LiteLLMProxyThread(
             models_config=self.models,
             is_model_running_callback=self.is_llama_runner_running, # Pass the callback method
+            get_runner_port_callback=self.get_runner_port, # Pass the callback method
+            request_runner_start_callback=self.request_runner_start, # Pass the callback method
             api_key=proxy_api_key,
-            active_model_name=active_model_name, # Pass active model name
-            active_model_port=active_model_port # Pass active model port
+            # active_model_name and active_model_port are no longer passed here
         )
-        # LiteLLM proxy thread doesn't currently have error/stopped signals, could add later
+        # Connect signals from the proxy thread if needed (e.g., started, stopped, error)
+        # self.litellm_proxy_thread.started.connect(self.on_litellm_proxy_started)
+        # self.litellm_proxy_thread.stopped.connect(self.on_litellm_proxy_stopped)
+        # self.litellm_proxy_thread.error.connect(self.on_litellm_proxy_error)
+
         self.litellm_proxy_thread.start()
 
 
     def stop_litellm_proxy(self):
         """
         Stops the LiteLLM proxy thread.
+        This is now called automatically on closeEvent.
         """
         if self.litellm_proxy_thread and self.litellm_proxy_thread.isRunning():
             print("Stopping LiteLLM Proxy...")
             self.litellm_status_label.setText("Stopping...")
-            self.litellm_start_button.setEnabled(False)
-            self.litellm_stop_button.setEnabled(False)
+            # Proxy buttons are removed
 
             self.litellm_proxy_thread.stop()
             # Don't wait() here in the UI thread
@@ -599,14 +604,10 @@ class MainWindow(QWidget):
             # A signal from the proxy thread would be better here.
             # For now, manually update status after signaling stop
             self.litellm_status_label.setText("Not Running")
-            self.litellm_start_button.setEnabled(True)
-            self.litellm_stop_button.setEnabled(False)
 
         else:
             print("LiteLLM Proxy is not running.")
             self.litellm_status_label.setText("Not Running")
-            self.litellm_start_button.setEnabled(True)
-            self.litellm_stop_button.setEnabled(False)
 
 
     @Slot(str)
@@ -626,6 +627,7 @@ class MainWindow(QWidget):
         """
         Slot to handle the LlamaCppRunner stopped signal.
         Cleans up the thread reference and updates UI.
+        Emits a signal for the proxy thread.
         """
         print(f"Llama Runner for {model_name} stopped.")
         if model_name in self.llama_runner_threads:
@@ -639,6 +641,10 @@ class MainWindow(QWidget):
                 status_widget.update_status("Not Running")
                 status_widget.update_port("N/A")
                 status_widget.set_buttons_enabled(True, False) # Enable start, disable stop
+
+            # Emit signal for the proxy thread
+            self.runner_stopped.emit(model_name)
+
         else:
             print(f"Stopped signal received for unknown or already cleaned up model: {model_name}")
 
@@ -669,10 +675,11 @@ class MainWindow(QWidget):
 
 
     @Slot(str, int) # Slot receives model_name and port
-    def on_llama_runner_port_ready(self, model_name: str, port: int):
+    def on_llama_runner_port_ready_and_emit(self, model_name: str, port: int):
         """
         Slot to handle the LlamaCppRunner port ready signal.
         Updates the UI with the assigned port and status.
+        Also emits a signal from MainWindow for the proxy thread.
         """
         print(f"Llama Runner for {model_name} ready on port {port}.")
         status_widget = self.model_status_widgets.get(model_name)
@@ -681,11 +688,31 @@ class MainWindow(QWidget):
             status_widget.update_status("Running")
             status_widget.set_buttons_enabled(False, True) # Disable start, enable stop
 
-        # If the LiteLLM proxy is running, and this is the first runner or the one it's configured for,
-        # we might need to restart the proxy to update its model_list config.
-        # For simplicity in this iteration, we require the user to restart the proxy manually
-        # if they start a different model while the proxy is running.
-        # A more advanced version would detect this and offer to restart the proxy.
+        # Emit signal for the proxy thread
+        self.runner_port_ready.emit(model_name, port)
+
+
+    # Optional: Slots for proxy thread signals if added later
+    # @Slot()
+    # def on_litellm_proxy_started(self):
+    #     print("LiteLLM Proxy started.")
+    #     self.litellm_status_label.setText("Running")
+    #     self.litellm_start_button.setEnabled(False)
+    #     self.litellm_stop_button.setEnabled(True)
+
+    # @Slot()
+    # def on_litellm_proxy_stopped(self):
+    #     print("LiteLLM Proxy stopped.")
+    #     self.litellm_status_label.setText("Not Running")
+    #     self.litellm_start_button.setEnabled(True)
+    #     self.litellm_stop_button.setEnabled(False)
+
+    # @Slot(str)
+    # def on_litellm_proxy_error(self, message: str):
+    #     print(f"LiteLLM Proxy error: {message}")
+    #     self.litellm_status_label.setText(f"Error: {message}")
+    #     self.litellm_start_button.setEnabled(True)
+    #     self.litellm_stop_button.setEnabled(False)
 
 
 # The main function is now in main.py

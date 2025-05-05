@@ -19,7 +19,8 @@ from PySide6.QtCore import QThread, QObject, Signal, Slot
 from llama_runner import gguf_metadata # Import the new metadata module
 
 # Configure logging (already done in main_window, but good practice here too)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Note: basicConfig is now handled in main.py for configurable levels
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Define standalone handlers that access state via app.state
 async def _get_lmstudio_models_handler(request: Request):
@@ -85,22 +86,59 @@ else:
 class LiteLLMProxyThread(QThread):
     """
     QThread to run the LiteLLM proxy in a separate thread.
+    Handles LM Studio API emulation and runner management requests.
     """
     # Define signals if needed (e.g., started, stopped, error)
     # started = Signal()
     # stopped = Signal()
     # error = Signal(str)
 
-    def __init__(self, models_config: Dict[str, Dict[str, Any]], is_model_running_callback: Callable[[str], bool], api_key: str = None, active_model_name: str = None, active_model_port: int = None):
+    def __init__(self,
+                 models_config: Dict[str, Dict[str, Any]],
+                 is_model_running_callback: Callable[[str], bool],
+                 get_runner_port_callback: Callable[[str], Optional[int]],
+                 request_runner_start_callback: Callable[[str], None], # Callback to request runner start
+                 api_key: str = None):
         super().__init__()
         self.models_config = models_config
         self.is_model_running_callback = is_model_running_callback
+        self.get_runner_port_callback = get_runner_port_callback
+        self.request_runner_start_callback = request_runner_start_callback # Store the callback
         self.api_key = api_key
-        self.active_model_name = active_model_name # Model name for LiteLLM's model_list
-        self.active_model_port = active_model_port # Port for LiteLLM's model_list
         self.is_running = False
         self._uvicorn_server = None
         self._temp_config_path = None
+
+        # Store a mapping of model_name to a Future/Task that resolves when the runner is ready
+        # This is needed for the on-demand startup logic (to be implemented later)
+        self._runner_ready_futures: Dict[str, asyncio.Future] = {}
+
+        # Connect to signals from MainWindow (assuming MainWindow connects them)
+        # Example: self.runner_port_ready.connect(self.on_runner_port_ready)
+        # This connection needs to happen in MainWindow after creating the proxy thread.
+
+
+    # @Slot(str, int)
+    # def on_runner_port_ready(self, model_name: str, port: int):
+    #     """Slot to handle runner_port_ready signal from MainWindow."""
+    #     logging.debug(f"Proxy thread received runner_port_ready for {model_name} on port {port}")
+    #     # When a runner is ready, resolve its corresponding Future
+    #     if model_name in self._runner_ready_futures and not self._runner_ready_futures[model_name].done():
+    #         self._runner_ready_futures[model_name].set_result(port)
+    #         logging.debug(f"Resolved runner_ready_future for {model_name} with port {port}")
+
+    # @Slot(str)
+    # def on_runner_stopped(self, model_name: str):
+    #     """Slot to handle runner_stopped signal from MainWindow."""
+    #     logging.debug(f"Proxy thread received runner_stopped for {model_name}")
+    #     # If a runner stops, cancel or remove its Future
+    #     if model_name in self._runner_ready_futures:
+    #          # It might be done already if it started successfully
+    #          if not self._runner_ready_futures[model_name].done():
+    #              self._runner_ready_futures[model_name].cancel() # Or set exception
+    #          del self._runner_ready_futures[model_name]
+    #          logging.debug(f"Cleaned up runner_ready_future for {model_name}")
+
 
     def run(self):
         """
@@ -133,32 +171,33 @@ class LiteLLMProxyThread(QThread):
     async def run_async(self):
         """
         Asynchronous part of the proxy runner.
+        Configures LiteLLM with all models and starts the Uvicorn server.
         """
         print("Starting LiteLLM Proxy...")
         try:
             # 1. Define your proxy config as a Python dict
+            # Configure LiteLLM's model_list with ALL configured models.
+            # The api_base will be a placeholder for now. Dynamic routing will handle this later.
             proxy_config = {
-                "model_list": [], # Will add the active model here
+                "model_list": [],
                 "general_settings": {
                     "master_key": self.api_key if self.api_key else None
                 }
             }
 
-            # Add the active model to the LiteLLM model_list if provided
-            if self.active_model_name and self.active_model_port:
+            # Add all configured models to the LiteLLM model_list
+            for model_name in self.models_config.keys():
+                 # Use a dummy api_base for now. The dynamic routing/middleware
+                 # will intercept requests and route them to the correct runner port.
                  proxy_config["model_list"].append({
-                     "model_name": self.active_model_name,
+                     "model_name": model_name,
                      "litellm_params": {
-                         "model": f"openai/{self.active_model_name}", # Use openai provider pointing to llama.cpp
-                         "api_base": f"http://127.0.0.1:{self.active_model_port}",
+                         "model": f"openai/{model_name}", # Use openai provider pointing to llama.cpp
+                         "api_base": "http://127.0.0.1:1", # Dummy port
                          "api_key": "sk-dummy" # Dummy key required by LiteLLM for openai provider
                      }
                  })
-                 print(f"LiteLLM Proxy configured for active model '{self.active_model_name}' on port {self.active_model_port}.")
-            else:
-                 print("LiteLLM Proxy started without an active Llama runner configured in model_list.")
-                 # The proxy will start, but /v1 endpoints won't work until a model is configured/restarted.
-                 # The /v0/models endpoint should still work.
+            logging.info(f"LiteLLM Proxy configured with {len(proxy_config['model_list'])} models in model_list.")
 
 
             # 2. Dump to a temp YAML file
@@ -175,12 +214,17 @@ class LiteLLMProxyThread(QThread):
             # This state will be accessible by the standalone handler functions
             app.state.models_config = self.models_config
             app.state.is_model_running_callback = self.is_model_running_callback
+            app.state.get_runner_port_callback = self.get_runner_port_callback # Pass the new callback
+            app.state.request_runner_start_callback = self.request_runner_start_callback # Pass the new callback
+            # app.state.runner_ready_futures = self._runner_ready_futures # Pass the futures dict
 
             # Use port 1234 as required
             uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=1234, reload=False)
             self._uvicorn_server = uvicorn.Server(uvicorn_config)
 
             print("LiteLLM Proxy listening on http://0.0.0.0:1234")
+            logging.info("LiteLLM Proxy listening on http://0.0.0.0:1234")
+
 
             # This call is blocking until the server stops
             await self._uvicorn_server.serve()
@@ -193,6 +237,7 @@ class LiteLLMProxyThread(QThread):
         finally:
             # Cleanup happens in run()'s finally block now
             print("LiteLLM Proxy stopped.")
+            logging.info("LiteLLM Proxy stopped.")
 
 
     def stop(self):
@@ -206,3 +251,4 @@ class LiteLLMProxyThread(QThread):
             # This might not immediately stop the serve() call.
             # A more robust stop might involve sending a signal or using a shutdown event.
             # For now, setting should_exit is the standard uvicorn way.
+
