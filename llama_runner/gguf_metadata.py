@@ -87,19 +87,17 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         reader = GGUFReader(model_path, 'r')
         metadata = {}
 
-        # Helper to get key value safely
-        def get_key_value(key: str) -> Any:
-            gguf_value = reader.get_key(key)
-            return gguf_value.value if gguf_value else None
+        # Iterate through all fields and extract key-value pairs
+        for key, field in reader.fields.items():
+            try:
+                # Access the value using the method shown in the example reader.py
+                # field.data[0] is the index into field.parts
+                value = field.parts[field.data[0]]
+                metadata[key] = value
+            except (IndexError, TypeError, AttributeError) as e:
+                logging.warning(f"Could not extract value for key '{key}' from {model_path}: {e}")
+                metadata[key] = None # Store None or skip? Store None for now.
 
-        # Extract common metadata using get_key().value
-        metadata['general.architecture'] = get_key_value('general.architecture')
-        metadata['general.name'] = get_key_value('general.name')
-        metadata['llama.context_length'] = get_key_value('llama.context_length')
-        metadata['llama.block_count'] = get_key_value('llama.block_count')
-        metadata['llama.embedding_length'] = get_key_value('llama.embedding_length')
-        metadata['tokenizer.model'] = get_key_value('tokenizer.model')
-        metadata['general.file_type'] = get_key_value('general.file_type') # This might indicate quantization
 
         # Attempt to determine quantization from file type or name
         quantization = "Unknown"
@@ -107,52 +105,50 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         if file_type is not None:
              # Map GGUF file_type integer to string representation (based on gguf.py)
              # This mapping might need refinement based on actual gguf library values
+             # Using a simplified map for common types, as the full map is large
              file_type_map = {
-                 0: "f32", 1: "f16", 2: "q4_0", 3: "q4_1", 4: "q4_1_f16",
+                 0: "f32", 1: "f16", 2: "q4_0", 3: "q4_1",
                  5: "q8_0", 6: "q5_0", 7: "q5_1", 8: "q2_k", 9: "q3_k_s",
                  10: "q3_k_m", 11: "q3_k_l", 12: "q4_k_s", 13: "q4_k_m",
-                 14: "q5_k_s", 15: "q5_k_m", 16: "q6_k", 17: "q8_k", 18: "iq4_nl",
-                 19: "iq3_xxs", 20: "iq2_xs", 21: "iq2_s", 22: "iq1_s", 23: "iq1_m",
-                 24: "bf16", 25: "ggml_iq2_xxs", 26: "ggml_iq2_xs", 27: "ggml_iq3_xxs",
-                 28: "ggml_iq0_xs", 29: "ggml_iq0_s", 30: "ggml_iqn_s", 31: "ggml_iqn_m",
-                 32: "ggml_iqn_l", 33: "ggml_iq4_nl", 34: "ggml_iq4_xs", 35: "ggml_iq1_s",
-                 36: "ggml_iq1_m", 37: "ggml_iq2_s", 38: "ggml_iq2_m", 39: "ggml_iq2_l",
-                 40: "ggml_iq3_s", 41: "ggml_iq3_m", 42: "ggml_iq3_l", 43: "ggml_iq4_s",
-                 44: "ggml_iq4_m", 45: "ggml_iq4_l", 46: "ggml_iq5_s", 47: "ggml_iq5_m",
-                 48: "ggml_iq5_l", 49: "ggml_iq6_s", 50: "ggml_iq6_m", 51: "ggml_iq6_l",
-                 52: "ggml_iq1_xxs", 53: "ggml_iq1_xs", 54: "ggml_iq2_xxs", 55: "ggml_iq2_xs",
-                 56: "ggml_iq3_xxs", 57: "ggml_iq0_xxs", 58: "ggml_iq0_xs", 59: "ggml_iq0_s",
-                 60: "ggml_iqn_xxs", 61: "ggml_iqn_xs", 62: "ggml_iqn_s", 63: "ggml_iqn_m",
-                 64: "ggml_iqn_l", 65: "ggml_iq4_xxs", 66: "ggml_iq4_xs", 67: "ggml_iq4_s",
-                 68: "ggml_iq4_m", 69: "ggml_iq4_l", 70: "ggml_iq5_xxs", 71: "ggml_iq5_xs",
-                 72: "ggml_iq5_s", 73: "ggml_iq5_m", 74: "ggml_iq5_l", 75: "ggml_iq6_xxs",
-                 76: "ggml_iq6_xs", 77: "ggml_iq6_s", 78: "ggml_iq6_m", 79: "ggml_iq6_l",
-                 80: "ggml_q2_k", 81: "ggml_q3_k_s", 82: "ggml_q3_k_m", 83: "ggml_q3_k_l",
-                 84: "ggml_q4_k_s", 85: "ggml_q4_k_m", 86: "ggml_q5_k_s", 87: "ggml_q5_k_m",
-                 88: "ggml_q6_k", 89: "ggml_q8_k", 90: "ggml_f32", 91: "ggml_f16", 92: "ggml_bf16"
+                 14: "q5_k_s", 15: "q5_k_m", 16: "q6_k", 17: "q8_k",
+                 24: "bf16",
+                 # Add more mappings if needed based on gguf.py source
              }
              quantization = file_type_map.get(file_type, f"Type_{file_type}")
         elif "q4_k_m" in os.path.basename(model_path).lower():
              quantization = "Q4_K_M" # Common convention
+        # Fallback: Check if quantization info is directly in metadata keys (e.g., "quantization.method")
+        elif metadata.get("quantization.method"):
+             quantization = metadata["quantization.method"]
+        elif metadata.get("quantization_version"): # Sometimes just a version number
+             quantization = f"Q{metadata['quantization_version']}"
+
 
         # Attempt to determine type (llm, vlm, embeddings)
         model_type = "llm" # Default to llm
-        if "embedding" in os.path.basename(model_path).lower() or "embed" in os.path.basename(model_path).lower():
+        # Check metadata keys first
+        if metadata.get("ggml.model.type") == "embedding":
+             model_type = "embeddings"
+        elif metadata.get("ggml.model.type") == "vlm":
+             model_type = "vlm"
+        # Fallback to filename heuristic if metadata key is missing
+        elif "embedding" in os.path.basename(model_path).lower() or "embed" in os.path.basename(model_path).lower():
              model_type = "embeddings"
         # VLM detection is harder, might need specific metadata keys or filename patterns
-        # For now, stick to llm/embeddings based on filename heuristic
+        # For now, stick to llm/embeddings based on metadata/filename heuristic
+
 
         # Construct LM Studio format
         lmstudio_format = {
             "id": metadata.get('general.name', os.path.basename(model_path)), # Use GGUF name or filename
             "object": "model",
             "type": model_type,
-            "publisher": "local", # Or try to extract from metadata if available
+            "publisher": metadata.get('general.url', 'local'), # Use URL if available, else local
             "arch": metadata.get('general.architecture', 'unknown'),
             "compatibility_type": "gguf", # Assuming all are gguf
             "quantization": quantization,
             # State will be added later based on runtime status
-            "max_context_length": metadata.get('llama.context_length', 4096) # Default if not found
+            "max_context_length": metadata.get('llama.context_length', metadata.get('phi3.context_length', metadata.get('qwen2.context_length', 4096))) # Check common keys, default if not found
         }
 
         logging.info(f"Successfully extracted metadata for {model_path}")
