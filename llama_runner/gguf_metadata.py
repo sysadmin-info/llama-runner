@@ -36,8 +36,7 @@ def calculate_file_hash(filepath: str) -> str:
         with open(filepath, 'rb') as f:
             # Read the file in chunks to avoid large memory usage
             while chunk := f.read(4096):
-                # FIX: Corrected the typo here. hasher.update should be called once.
-                hasher.update(chunk)
+                hasher.update(chunk) # Corrected typo
         return hasher.hexdigest()
     except FileNotFoundError:
         logging.error(f"File not found for hashing: {filepath}")
@@ -120,17 +119,14 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         # Helper to safely get a scalar value from metadata, handling lists/tuples
         def get_scalar_metadata(key: str, default: Any = None) -> Any:
             value = metadata.get(key)
-            if isinstance(value, (list, tuple)):
-                if len(value) > 0:
-                    # Return the first element for lists/tuples
-                    return value[0]
-                else:
-                    # Return default for empty lists/tuples
-                    return default
-            elif value is None:
+            # Keep unwrapping lists/tuples until a non-list/tuple or None is found
+            while isinstance(value, (list, tuple)) and len(value) > 0:
+                value = value[0]
+
+            if value is None:
                  return default
             else:
-                # Return the value directly if it's not a list/tuple
+                # Return the value if it's not a list/tuple (after unwrapping)
                 return value
 
 
