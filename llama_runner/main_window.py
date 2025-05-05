@@ -192,7 +192,7 @@ class LiteLLMProxyThread(QThread):
         super().__init__()
         self.model_name = model_name
         self.llama_cpp_port = llama_cpp_port
-        self.api_key = api_key # Store the optional API key
+        self.api_key = api_key # Store the optional API key for proxy authentication
         self.process = None # LiteLLM proxy is run embedded, not as a separate process
         self.is_running = False
         self._uvicorn_server = None # Hold reference to the uvicorn server
@@ -227,16 +227,21 @@ class LiteLLMProxyThread(QThread):
             proxy_config = {
                 "model_list": [
                     {
-                        "model_name": "gpt-3.5-turbo", # This is the alias LiteLLM will use
+                        # This is the alias clients will use to refer to the model
+                        "model_name": self.model_name,
                         "litellm_params": {
                             # Use 'openai' provider and point api_base to the llama.cpp server
-                            "model": "openai/gpt-3.5-turbo", # Use openai provider, model name can be anything for openai-compatible
-                            "api_base": f"http://127.0.0.1:{self.llama_cpp_port}"
+                            # The model name here should be openai/<model_id>.
+                            # The model_id can be anything, using the actual model name is clear.
+                            "model": f"openai/{self.model_name}",
+                            "api_base": f"http://127.0.0.1:{self.llama_cpp_port}",
+                            # Add a dummy API key for the openai provider, as LiteLLM seems to require it
+                            "api_key": "sk-dummy"
                         }
                     }
                 ],
                 "general_settings": {
-                    # Include master_key only if an API key was provided
+                    # Include master_key only if an API key was provided in config.json
                 }
             }
 
