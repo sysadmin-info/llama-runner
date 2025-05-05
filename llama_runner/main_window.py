@@ -1,12 +1,133 @@
 import sys
+import asyncio
+import subprocess
+import os
+import tempfile
+import yaml
+import logging
+
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel,
                                QPushButton, QLineEdit, QTabWidget)
+from PySide6.QtCore import QThread, QObject, pyqtSignal, Slot
+
+from llama_runner.config_loader import load_config
+from llama_runner.llama_cpp_runner import LlamaCppRunner
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class LlamaRunnerThread(QThread):
+    """
+    QThread to run the LlamaCppRunner in a separate thread to avoid blocking the UI.
+    """
+    def __init__(self, model_name: str, model_path: str, llama_cpp_runtime: str = None, **kwargs):
+        super().__init__()
+        self.model_name = model_name
+        self.model_path = model_path
+        self.llama_cpp_runtime = llama_cpp_runtime
+        self.kwargs = kwargs
+        self.runner = None
+        self.is_running = False
+
+    def run(self):
+        """
+        Runs the LlamaCppRunner in the thread.
+        """
+        self.is_running = True
+        asyncio.run(self.run_async())
+        self.is_running = False
+
+    async def run_async(self):
+        """
+        Asynchronous part of the runner.
+        """
+        self.runner = LlamaCppRunner(
+            model_name=self.model_name,
+            model_path=self.model_path,
+            llama_cpp_runtime=self.llama_cpp_runtime,
+            **self.kwargs
+        )
+        await self.runner.start()
+        # Keep the runner alive until the thread is stopped
+        while self.is_running:
+            await asyncio.sleep(1)
+        await self.runner.stop()
+
+    def stop(self):
+        """
+        Stops the LlamaCppRunner.
+        """
+        self.is_running = False
+
+class LiteLLMProxyThread(QThread):
+    """
+    QThread to run the LiteLLM proxy in a separate thread.
+    """
+    def __init__(self):
+        super().__init__()
+        self.process = None
+        self.is_running = False
+
+    def run(self):
+        """
+        Runs the LiteLLM proxy in the thread.
+        """
+        self.is_running = True
+        asyncio.run(self.run_async())
+        self.is_running = False
+
+    async def run_async(self):
+        """
+        Asynchronous part of the proxy runner.
+        """
+        # TODO: Implement the LiteLLM proxy startup logic here
+        # This is a placeholder implementation
+        print("Starting LiteLLM Proxy...")
+        try:
+            # Example: Run a simple command
+            self.process = subprocess.Popen(
+                ["echo", "LiteLLM Proxy is running"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True
+            )
+            while self.is_running:
+                if self.process.poll() is not None:
+                    break
+                await asyncio.sleep(1)
+        except Exception as e:
+            print(f"Error starting LiteLLM Proxy: {e}")
+        finally:
+            if self.process:
+                self.process.terminate()
+                self.process.wait()
+            print("LiteLLM Proxy stopped.")
+
+    def stop(self):
+        """
+        Stops the LiteLLM proxy.
+        """
+        self.is_running = False
+        if self.process:
+            self.process.terminate()
+            self.process.wait()
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("Llama Runner")
+
+        self.config = load_config()
+        self.llama_runtimes = self.config.get("llama-runtimes", {})
+        self.default_runtime = "llama-server"  # Default to llama-server from PATH
+        self.model_name = "test-model"  # hardcoded for now
+        self.model_config = self.config.get("models", {}).get(self.model_name, {})
+        self.model_path = self.model_config.get("model_path")
+        self.llama_cpp_runtime = self.llama_runtimes.get(self.model_config.get("llama_cpp_runtime", "default"), self.default_runtime)
+
+        self.llama_runner_thread = None
+        self.litellm_proxy_thread = None
 
         self.layout = QVBoxLayout()
 
@@ -41,11 +162,60 @@ class MainWindow(QWidget):
         self.layout.addWidget(self.tabs)
         self.setLayout(self.layout)
 
-# if __name__ == '__main__':
-#     app = QApplication(sys.argv)
-#     window = MainWindow()
-#     window.show()
-#     sys.exit(app.exec())
+        # Connect buttons to actions
+        self.llama_start_button.clicked.connect(self.start_llama_runner)
+        self.llama_stop_button.clicked.connect(self.stop_llama_runner)
+        self.litellm_start_button.clicked.connect(self.start_litellm_proxy)
+        self.litellm_stop_button.clicked.connect(self.stop_litellm_proxy)
+
+    def start_llama_runner(self):
+        """
+        Starts the LlamaCppRunner in a separate thread.
+        """
+        if self.llama_runner_thread is None or not self.llama_runner_thread.isRunning():
+            self.llama_runner_thread = LlamaRunnerThread(
+                model_name=self.model_name,
+                model_path=self.model_path,
+                llama_cpp_runtime=self.llama_cpp_runtime,
+                **self.model_config.get("parameters", {})
+            )
+            self.llama_runner_thread.start()
+            self.llama_status_label.setText("Running...")
+        else:
+            print("Llama Runner is already running.")
+
+    def stop_llama_runner(self):
+        """
+        Stops the LlamaCppRunner thread.
+        """
+        if self.llama_runner_thread and self.llama_runner_thread.isRunning():
+            self.llama_runner_thread.stop()
+            self.llama_runner_thread.wait()  # Wait for the thread to finish
+            self.llama_status_label.setText("Not Running")
+        else:
+            print("Llama Runner is not running.")
+
+    def start_litellm_proxy(self):
+        """
+        Starts the LiteLLM proxy in a separate thread.
+        """
+        if self.litellm_proxy_thread is None or not self.litellm_proxy_thread.isRunning():
+            self.litellm_proxy_thread = LiteLLMProxyThread()
+            self.litellm_proxy_thread.start()
+            self.litellm_status_label.setText("Running...")
+        else:
+            print("LiteLLM Proxy is already running.")
+
+    def stop_litellm_proxy(self):
+        """
+        Stops the LiteLLM proxy thread.
+        """
+        if self.litellm_proxy_thread and self.litellm_proxy_thread.isRunning():
+            self.litellm_proxy_thread.stop()
+            self.litellm_proxy_thread.wait()  # Wait for the thread to finish
+            self.litellm_status_label.setText("Not Running")
+        else:
+            print("LiteLLM Proxy is not running.")
 
 # Here's the first *SEARCH/REPLACE* block to modify the `main.py` file:
 #
