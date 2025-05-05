@@ -6,10 +6,10 @@ import tempfile
 import yaml
 import logging
 import traceback
-import time # Import time for sleep
+import time
 
-from litellm.proxy.proxy_server import app
-import uvicorn
+from litellm.proxy.proxy_server import app # Keep import for potential future direct interaction if needed
+import uvicorn # Keep import if needed elsewhere, but proxy thread handles server
 
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QLineEdit, QTabWidget, QMessageBox,
@@ -19,6 +19,8 @@ from PySide6.QtCore import QThread, QObject, Signal, Slot, Qt
 
 from llama_runner.config_loader import load_config
 from llama_runner.llama_cpp_runner import LlamaCppRunner
+from llama_runner.lite_llm_proxy_thread import LiteLLMProxyThread # Import the proxy thread from its new file
+from llama_runner import gguf_metadata # Import the new metadata module
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -180,121 +182,7 @@ class LlamaRunnerThread(QThread):
             await self.runner.stop()
 
 
-class LiteLLMProxyThread(QThread):
-    """
-    QThread to run the LiteLLM proxy in a separate thread.
-    """
-    def __init__(self, model_name: str, llama_cpp_port: int, api_key: str = None):
-        super().__init__()
-        self.model_name = model_name
-        self.llama_cpp_port = llama_cpp_port
-        self.api_key = api_key # Store the optional API key for proxy authentication
-        self.process = None # LiteLLM proxy is run embedded, not as a separate process
-        self.is_running = False
-        self._uvicorn_server = None # Hold reference to the uvicorn server
-
-    def run(self):
-        """
-        Runs the LiteLLM proxy in the thread.
-        """
-        self.is_running = True
-        try:
-            # Use a new event loop for this thread
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            self.loop.run_until_complete(self.run_async())
-        except Exception as e:
-            logging.error(f"Unexpected error in LiteLLMProxyThread run: {e}\n{traceback.format_exc()}")
-        finally:
-            self.is_running = False
-            if hasattr(self, 'loop') and self.loop.is_running():
-                 self.loop.stop()
-            if hasattr(self, 'loop') and not self.loop.is_closed():
-                 self.loop.close()
-
-
-    async def run_async(self):
-        """
-        Asynchronous part of the proxy runner.
-        """
-        print("Starting LiteLLM Proxy...")
-        try:
-            # 1. Define your proxy config as a Python dict
-            proxy_config = {
-                "model_list": [
-                    {
-                        # This is the alias clients will use to refer to the model
-                        "model_name": self.model_name,
-                        "litellm_params": {
-                            # Use 'openai' provider and point api_base to the llama.cpp server
-                            # The model name here should be openai/<model_id>.
-                            # The model_id can be anything, using the actual model name is clear.
-                            "model": f"openai/{self.model_name}",
-                            "api_base": f"http://127.0.0.1:{self.llama_cpp_port}",
-                            # Add a dummy API key for the openai provider, as LiteLLM seems to require it
-                            "api_key": "sk-dummy"
-                        }
-                    }
-                ],
-                "general_settings": {
-                    # Include master_key only if an API key was provided in config.json
-                }
-            }
-
-            if self.api_key:
-                 proxy_config["general_settings"]["master_key"] = self.api_key
-                 print("LiteLLM Proxy configured with API Key authentication.")
-            else:
-                 print("LiteLLM Proxy configured without API Key authentication.")
-
-
-            # 2. Dump to a temp YAML file
-            # Use a persistent temp file that we can clean up later
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".yaml", mode='w') as f:
-                yaml.dump(proxy_config, f)
-                tmp_path = f.name
-            logging.info(f"LiteLLM proxy config written to {tmp_path}")
-
-            # 3. Point LiteLLM at that file
-            os.environ["CONFIG_FILE_PATH"] = tmp_path
-
-            # 4. Start the proxy embedded via Uvicorn
-            # We need to run uvicorn's serve() method in the asyncio loop
-            uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=4000, reload=False) # reload=False in embedded mode
-            self._uvicorn_server = uvicorn.Server(uvicorn_config)
-
-            # This call is blocking until the server stops
-            await self._uvicorn_server.serve()
-
-            # Clean up the temporary config file after the server stops
-            try:
-                os.unlink(tmp_path)
-                logging.info(f"Cleaned up temporary LiteLLM config file: {tmp_path}")
-            except OSError as e:
-                logging.error(f"Error cleaning up temporary LiteLLM config file {tmp_path}: {e}")
-
-
-        except Exception as e:
-            print(f"Error starting LiteLLM Proxy: {e}")
-            logging.error(f"Error starting LiteLLM Proxy: {e}\n{traceback.format_exc()}")
-        finally:
-            # The uvicorn server.serve() call blocks until it's stopped,
-            # so cleanup happens after it returns.
-            print("LiteLLM Proxy stopped.")
-
-
-    def stop(self):
-        """
-        Signals the LiteLLM proxy thread to stop.
-        """
-        self.is_running = False
-        if self._uvicorn_server:
-            # This will cause the server.serve() await call to return
-            self._uvicorn_server.should_exit = True
-            # Note: Stopping uvicorn gracefully can be tricky in an embedded context.
-            # This might not immediately stop the serve() call.
-            # A more robust stop might involve sending a signal or using a shutdown event.
-            # For now, setting should_exit is the standard uvicorn way.
+# LiteLLMProxyThread is now in its own file: llama_runner.lite_llm_proxy_thread
 
 
 class ModelStatusWidget(QWidget):
@@ -356,6 +244,19 @@ class MainWindow(QWidget):
         if not isinstance(self.concurrent_runners_limit, int) or self.concurrent_runners_limit < 1:
              logging.warning(f"Invalid 'concurrentRunners' value in config: {self.concurrent_runners_limit}. Defaulting to 1.")
              self.concurrent_runners_limit = 1
+
+        # Initialize metadata cache and load metadata for all models
+        gguf_metadata.ensure_cache_dir_exists()
+        self.model_metadata_cache = {}
+        for model_name, model_config in self.models.items():
+             model_path = model_config.get("model_path")
+             if model_path:
+                 # Load/extract metadata on startup. State is 'not-loaded' initially.
+                 metadata = gguf_metadata.get_model_lmstudio_format(model_name, model_path, is_running=False)
+                 if metadata:
+                     self.model_metadata_cache[model_name] = metadata
+             else:
+                 logging.warning(f"Model '{model_name}' has no 'model_path' in config. Skipping metadata caching.")
 
 
         self.llama_runner_threads = {}  # Dictionary to store threads for each model
@@ -475,6 +376,33 @@ class MainWindow(QWidget):
             # No item selected
             self.model_status_stack.setCurrentWidget(self.no_model_selected_widget)
 
+    def is_llama_runner_running(self, model_name: str) -> bool:
+        """
+        Checks if the Llama runner thread for a given model is currently running
+        and if the underlying process is also running.
+        """
+        thread = self.llama_runner_threads.get(model_name)
+        if thread and thread.isRunning():
+            # Check if the runner instance exists and its process is running
+            if thread.runner and thread.runner.is_running():
+                 return True
+            else:
+                 # Thread is running, but runner process is not. This is an inconsistent state.
+                 # Log a warning and treat as not running.
+                 logging.warning(f"Llama runner thread for {model_name} is running, but process is not.")
+                 return False
+        return False
+
+    def get_running_llama_runner_info(self) -> Optional[tuple[str, int]]:
+        """
+        Finds the name and port of the first currently running Llama runner.
+        Returns (model_name, port) or None if no runner is running.
+        """
+        for model_name, thread in list(self.llama_runner_threads.items()):
+            if thread.isRunning() and thread.runner and thread.runner.is_running() and thread.runner.get_port() is not None:
+                return (model_name, thread.runner.get_port())
+        return None
+
 
     def start_llama_runner(self, model_name: str):
         """
@@ -505,6 +433,7 @@ class MainWindow(QWidget):
                      # Wait for the thread to actually stop
                      timeout_seconds = 15
                      start_time = time.time()
+                     # Wait until the thread is no longer running or timeout
                      while thread_to_stop.isRunning() and (time.time() - start_time) < timeout_seconds:
                          QApplication.processEvents() # Keep UI responsive
                          time.sleep(0.1) # Wait a bit
@@ -617,24 +546,22 @@ class MainWindow(QWidget):
             print("LiteLLM Proxy is already running.")
             return
 
-        # Find the first running Llama Runner to connect to
-        running_model_name = None
-        running_port = None
-        # Iterate over a copy of items to avoid issues if a thread stops during iteration
-        for model_name, thread in list(self.llama_runner_threads.items()):
-            # Check if the thread is running AND the runner instance exists AND has a port
-            # Also check if the underlying process is still alive
-            if thread.isRunning() and thread.runner is not None and thread.runner.is_running() and thread.runner.get_port() is not None:
-                running_model_name = model_name
-                running_port = thread.runner.get_port()
-                break
+        # Find the first running Llama Runner to connect the proxy to
+        running_runner_info = self.get_running_llama_runner_info()
 
-        if not running_model_name or running_port is None:
-            QMessageBox.warning(self, "LiteLLM Proxy", "No Llama Runner is currently running or port not available. Start one first.")
-            print("No Llama Runner is running or port not available. Cannot start LiteLLM Proxy.")
-            return
+        # Note: The LiteLLM proxy's /v1 endpoints will only work if a runner is active
+        # and its port is passed here. The /v0/models endpoint will work regardless.
+        # We allow starting the proxy even without an active runner, but warn the user.
+        active_model_name = None
+        active_model_port = None
+        if running_runner_info:
+             active_model_name, active_model_port = running_runner_info
+             print(f"Starting LiteLLM Proxy, connecting to active model '{active_model_name}' on port {active_model_port}...")
+        else:
+             print("No Llama Runner is currently running. Starting LiteLLM Proxy without an active model configured.")
+             QMessageBox.information(self, "LiteLLM Proxy", "No Llama Runner is currently running. The LiteLLM proxy will start, but chat/completion endpoints will not work until a model is started.")
 
-        print(f"Starting LiteLLM Proxy for model '{running_model_name}' on port {running_port}...")
+
         self.litellm_status_label.setText("Running...")
         self.litellm_start_button.setEnabled(False)
         self.litellm_stop_button.setEnabled(True)
@@ -642,10 +569,14 @@ class MainWindow(QWidget):
         # Get the optional API key from the config
         proxy_api_key = self.litellm_proxy_config.get("api_key")
 
+        # Pass models config and the running status callback to the proxy thread
+        # Also pass the active model info for the LiteLLM model_list config
         self.litellm_proxy_thread = LiteLLMProxyThread(
-            model_name=running_model_name,
-            llama_cpp_port=running_port,
-            api_key=proxy_api_key # Pass the API key to the thread
+            models_config=self.models,
+            is_model_running_callback=self.is_llama_runner_running, # Pass the callback method
+            api_key=proxy_api_key,
+            active_model_name=active_model_name, # Pass active model name
+            active_model_port=active_model_port # Pass active model port
         )
         # LiteLLM proxy thread doesn't currently have error/stopped signals, could add later
         self.litellm_proxy_thread.start()
@@ -748,6 +679,12 @@ class MainWindow(QWidget):
             status_widget.update_port(port)
             status_widget.update_status("Running")
             status_widget.set_buttons_enabled(False, True) # Disable start, enable stop
+
+        # If the LiteLLM proxy is running, and this is the first runner or the one it's configured for,
+        # we might need to restart the proxy to update its model_list config.
+        # For simplicity in this iteration, we require the user to restart the proxy manually
+        # if they start a different model while the proxy is running.
+        # A more advanced version would detect this and offer to restart the proxy.
 
 
 # The main function is now in main.py
