@@ -99,7 +99,7 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
             try:
                 # Access the value using the method shown in the example reader.py
                 # field.data[0] is the index into field.parts
-                # This might return a list/tuple even for scalar types in some cases
+                # This might return a list/tuple or array-like object even for scalar types
                 value = field.parts[field.data[0]]
                 metadata[key] = value
                 # Add detailed logging for extracted values, especially non-scalar ones
@@ -116,18 +116,31 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                  logging.warning(f"Unexpected error extracting value for key '{key}' from {model_path}: {e}\n{traceback.format_exc()}")
                  metadata[key] = None
 
-        # Helper to safely get a scalar value from metadata, handling lists/tuples
+        # Helper to safely get a scalar value from metadata, handling lists/tuples/arrays
         def get_scalar_metadata(key: str, default: Any = None) -> Any:
             value = metadata.get(key)
-            # Keep unwrapping lists/tuples until a non-list/tuple or None is found
+            # Keep unwrapping lists/tuples/arrays until a non-container or None is found
             while isinstance(value, (list, tuple)) and len(value) > 0:
                 value = value[0]
+            # Also handle potential numpy arrays if gguf returns them
+            if hasattr(value, 'tolist') and callable(value.tolist):
+                 try:
+                     list_value = value.tolist()
+                     while isinstance(list_value, (list, tuple)) and len(list_value) > 0:
+                         list_value = list_value[0]
+                     value = list_value
+                 except Exception:
+                     pass # Ignore errors during tolist conversion
 
             if value is None:
                  return default
             else:
-                # Return the value if it's not a list/tuple (after unwrapping)
-                return value
+                # Attempt to convert to string to handle various scalar types consistently
+                try:
+                    return str(value)
+                except Exception:
+                    logging.warning(f"Could not convert metadata value for key '{key}' to string: {value}")
+                    return default
 
 
         # --- Construct LM Studio format based on requested fields ---
@@ -142,9 +155,9 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         # Check metadata keys first
         model_type = "llm" # Default to llm
         ggml_model_type = get_scalar_metadata("ggml.model.type")
-        if ggml_model_type == "embedding":
+        if ggml_model_type and ggml_model_type.lower() == "embedding":
              model_type = "embeddings"
-        elif ggml_model_type == "vlm":
+        elif ggml_model_type and ggml_model_type.lower() == "vlm":
              model_type = "vlm"
         # Fallback to filename heuristic if metadata key is missing
         elif "embedding" in os.path.basename(model_path).lower() or "embed" in os.path.basename(model_path).lower():
@@ -164,19 +177,30 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
 
         # quantization: GGMLQuantizationType(general.file_type).name (fallback to heuristic)
         quantization = "Unknown"
-        file_type = get_scalar_metadata('general.file_type') # Use the helper
-        if GGUF_AVAILABLE and file_type is not None:
+        file_type_val = get_scalar_metadata('general.file_type') # Use the helper
+        if GGUF_AVAILABLE and file_type_val is not None:
             try:
                 # Attempt to use the enum name
-                # Ensure file_type is an integer if it came from metadata
-                if isinstance(file_type, int):
-                    quantization = GGMLQuantizationType(file_type).name
+                # Ensure file_type_val is an integer if it came from metadata
+                if isinstance(file_type_val, str): # It might be a string if get_scalar_metadata converted it
+                    try:
+                        file_type_int = int(file_type_val)
+                    except (ValueError, TypeError):
+                        logging.warning(f"'general.file_type' is a non-integer string ('{file_type_val}') in {model_path}. Value: {file_type_val}")
+                        file_type_int = None # Fall through to heuristic
+                elif isinstance(file_type_val, int):
+                    file_type_int = file_type_val
                 else:
-                    logging.warning(f"'general.file_type' is not an integer ({type(file_type)}) in {model_path}. Value: {file_type}")
-                    # Fall through to heuristic
+                    logging.warning(f"'general.file_type' is not an integer or string ({type(file_type_val)}) in {model_path}. Value: {file_type_val}")
+                    file_type_int = None # Fall through to heuristic
+
+                if file_type_int is not None:
+                    quantization = GGMLQuantizationType(file_type_int).name
+                # else: fall through to heuristic
+
             except ValueError:
-                logging.warning(f"Unknown GGMLQuantizationType value: {file_type} for {model_path}")
-                quantization = f"Type_{file_type}" # Fallback if enum value is unknown
+                logging.warning(f"Unknown GGMLQuantizationType integer value: {file_type_val} for {model_path}")
+                quantization = f"Type_{file_type_val}" # Fallback if enum value is unknown
             except Exception as e:
                  logging.warning(f"Error getting quantization name from enum for {model_path}: {e}")
                  # Fall through to heuristic
@@ -193,28 +217,50 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
 
         # max_context_length: ${general.architecture}.context_length (fallback to common keys, then default)
         max_ctx = 4096 # Default value
+        # Use the architecture string obtained earlier
         if architecture != 'unknown':
              # Try the architecture-specific key
              ctx_key = f'{architecture}.context_length'
-             arch_ctx = get_scalar_metadata(ctx_key)
-             if arch_ctx is not None:
-                 max_ctx = arch_ctx
+             arch_ctx_str = get_scalar_metadata(ctx_key)
+             if arch_ctx_str is not None:
+                 try:
+                     max_ctx = int(arch_ctx_str)
+                 except (ValueError, TypeError):
+                     logging.warning(f"Could not convert architecture-specific context_length '{arch_ctx_str}' to integer for {model_path}. Using default or common keys.")
+                     # Fall through to check common keys
 
         # If architecture-specific key wasn't found or architecture was unknown, check common keys
         # Only check common keys if the current max_ctx is still the default or None
-        if max_ctx == 4096 or max_ctx is None:
-             max_ctx = get_scalar_metadata('llama.context_length', max_ctx)
-             max_ctx = get_scalar_metadata('phi3.context_length', max_ctx)
-             max_ctx = get_scalar_metadata('qwen2.context_length', max_ctx)
+        if max_ctx == 4096: # Check against the default value
+             common_ctx_str = get_scalar_metadata('llama.context_length')
+             if common_ctx_str is not None:
+                 try:
+                     max_ctx = int(common_ctx_str)
+                 except (ValueError, TypeError):
+                     logging.warning(f"Could not convert common context_length 'llama.context_length' ('{common_ctx_str}') to integer for {model_path}. Using default.")
+
+             if max_ctx == 4096: # Check again
+                 common_ctx_str = get_scalar_metadata('phi3.context_length')
+                 if common_ctx_str is not None:
+                     try:
+                         max_ctx = int(common_ctx_str)
+                     except (ValueError, TypeError):
+                         logging.warning(f"Could not convert common context_length 'phi3.context_length' ('{common_ctx_str}') to integer for {model_path}. Using default.")
+
+             if max_ctx == 4096: # Check again
+                 common_ctx_str = get_scalar_metadata('qwen2.context_length')
+                 if common_ctx_str is not None:
+                     try:
+                         max_ctx = int(common_ctx_str)
+                     except (ValueError, TypeError):
+                         logging.warning(f"Could not convert common context_length 'qwen2.context_length' ('{common_ctx_str}') to integer for {model_path}. Using default.")
              # Add other common architecture keys here if needed
 
-        # Ensure max_ctx is an integer
+
+        # Ensure max_ctx is an integer (final check)
         if not isinstance(max_ctx, int):
-             try:
-                 max_ctx = int(max_ctx)
-             except (ValueError, TypeError):
-                 logging.warning(f"Could not convert max_context_length '{max_ctx}' to integer for {model_path}. Defaulting to 4096.")
-                 max_ctx = 4096
+             logging.warning(f"Final max_context_length '{max_ctx}' is not an integer for {model_path}. Defaulting to 4096.")
+             max_ctx = 4096
 
 
         # Construct the final LM Studio format dictionary
