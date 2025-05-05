@@ -211,6 +211,11 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         # quantization: GGMLQuantizationType(general.file_type).name (fallback to heuristic)
         quantization = "Unknown"
         file_type_val = get_scalar_metadata('general.file_type') # Use the helper to get the raw value
+
+        # --- Add debug logging for file_type_val ---
+        logging.debug(f"Raw 'general.file_type' value: {file_type_val}, Type: {type(file_type_val)}")
+        # --- End debug logging ---
+
         if GGUF_AVAILABLE and file_type_val is not None:
             try:
                 # Attempt to convert file_type_val to an integer
