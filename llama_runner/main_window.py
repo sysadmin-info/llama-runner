@@ -5,15 +5,17 @@ import os
 import tempfile
 import yaml
 import logging
-import traceback # Import traceback for detailed error logging
+import traceback
+import time # Import time for sleep
 
 from litellm.proxy.proxy_server import app
 import uvicorn
 
-from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel,
+from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QLineEdit, QTabWidget, QMessageBox,
-                               QDialog, QTextEdit, QDialogButtonBox) # Import necessary widgets for custom dialog
-from PySide6.QtCore import QThread, QObject, Signal, Slot
+                               QDialog, QTextEdit, QDialogButtonBox, QListWidget,
+                               QStackedWidget, QSizePolicy, QSpacerItem)
+from PySide6.QtCore import QThread, QObject, Signal, Slot, Qt
 
 from llama_runner.config_loader import load_config
 from llama_runner.llama_cpp_runner import LlamaCppRunner
@@ -28,8 +30,8 @@ class ErrorOutputDialog(QDialog):
     def __init__(self, title, message, output_lines, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.setMinimumWidth(400) # Give it a reasonable minimum width
-        self.setMinimumHeight(200) # Give it a reasonable minimum height
+        self.setMinimumWidth(400)
+        self.setMinimumHeight(200)
 
         layout = QVBoxLayout()
 
@@ -40,10 +42,10 @@ class ErrorOutputDialog(QDialog):
             output_text_edit = QTextEdit()
             output_text_edit.setReadOnly(True)
             output_text_edit.setPlainText("\n".join(output_lines))
-            output_text_edit.setMinimumHeight(100) # Ensure text box has some height
-            output_text_edit.setSizePolicy(output_text_edit.sizePolicy().horizontalPolicy(), output_text_edit.sizePolicy().verticalPolicy()) # Allow vertical expansion
+            output_text_edit.setMinimumHeight(100)
+            output_text_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-            layout.addWidget(QLabel("Last Output Lines:")) # Label for the text box
+            layout.addWidget(QLabel("Last Output Lines:"))
             layout.addWidget(output_text_edit)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok)
@@ -59,8 +61,7 @@ class LlamaRunnerThread(QThread):
     """
     started = Signal()
     stopped = Signal()
-    # Modified error signal to include output buffer
-    error = Signal(str, list)
+    error = Signal(str, list) # Signal includes error message and output buffer
     port_ready = Signal(int)
 
     def __init__(self, model_name: str, model_path: str, llama_cpp_runtime: str = None, **kwargs):
@@ -116,12 +117,8 @@ class LlamaRunnerThread(QThread):
             await self.runner.start()
 
             # Check if startup message was found and port was set
-            # The runner.start() method now handles the case where the process exits immediately
-            # This check is for cases where the process starts but doesn't print the expected line
             if self.runner.port is None:
-                 # The error message is now generic, the UI will show the buffer
                  raise RuntimeError("Llama.cpp server failed to start or extract port.")
-
 
             self.started.emit()
             self.port_ready.emit(self.runner.get_port()) # Emit the port number
@@ -156,7 +153,6 @@ class LlamaRunnerThread(QThread):
 
             # Check the final return code after ensuring the process is stopped
             # Only emit error if one hasn't been emitted by the except block
-            # Check self.runner and self.runner.process exists before accessing returncode
             if not self._error_emitted and self.runner and self.runner.process and self.runner.process.returncode != 0:
                 error_message = f"Llama.cpp server for {self.model_name} exited with code {self.runner.process.returncode}"
                 output_buffer = self.runner.get_output_buffer() if self.runner else []
@@ -301,19 +297,65 @@ class LiteLLMProxyThread(QThread):
             # For now, setting should_exit is the standard uvicorn way.
 
 
+class ModelStatusWidget(QWidget):
+    """
+    Widget to display status and controls for a single model.
+    """
+    def __init__(self, model_name: str, parent=None):
+        super().__init__(parent)
+        self.model_name = model_name
+        self.layout = QVBoxLayout()
+
+        self.model_label = QLabel(f"<b>{self.model_name}</b>")
+        self.model_label.setAlignment(Qt.AlignCenter)
+        self.model_label.setStyleSheet("font-size: 16pt;") # Larger font for model name
+        self.layout.addWidget(self.model_label)
+
+        self.status_label = QLabel("Status: Not Running")
+        self.layout.addWidget(self.status_label)
+
+        self.port_label = QLabel("Port: N/A")
+        self.layout.addWidget(self.port_label)
+
+        self.start_button = QPushButton(f"Start {self.model_name}")
+        self.layout.addWidget(self.start_button)
+
+        self.stop_button = QPushButton(f"Stop {self.model_name}")
+        self.stop_button.setEnabled(False) # Initially disabled
+        self.layout.addWidget(self.stop_button)
+
+        self.layout.addStretch() # Push everything to the top
+
+        self.setLayout(self.layout)
+
+    def update_status(self, status: str):
+        self.status_label.setText(f"Status: {status}")
+
+    def update_port(self, port: int | str):
+        self.port_label.setText(f"Port: {port}")
+
+    def set_buttons_enabled(self, start_enabled: bool, stop_enabled: bool):
+        self.start_button.setEnabled(start_enabled)
+        self.stop_button.setEnabled(stop_enabled)
+
+
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("Llama Runner")
-        self.resize(800, 600)  # Set initial window size
+        self.resize(800, 600)
 
         self.config = load_config()
         self.llama_runtimes = self.config.get("llama-runtimes", {})
-        self.default_runtime = "llama-server"  # Default to llama-server from PATH
+        self.default_runtime = "llama-server"
         self.models = self.config.get("models", {})
-        # Get LiteLLM proxy config
         self.litellm_proxy_config = self.config.get("litellm-proxy", {})
+        # Get concurrent runners limit from config, default to 1 if not specified or invalid
+        self.concurrent_runners_limit = self.config.get("concurrentRunners", 1)
+        if not isinstance(self.concurrent_runners_limit, int) or self.concurrent_runners_limit < 1:
+             logging.warning(f"Invalid 'concurrentRunners' value in config: {self.concurrent_runners_limit}. Defaulting to 1.")
+             self.concurrent_runners_limit = 1
 
 
         self.llama_runner_threads = {}  # Dictionary to store threads for each model
@@ -325,50 +367,46 @@ class MainWindow(QWidget):
 
         # Llama Runner Tab
         self.llama_tab = QWidget()
-        self.llama_layout = QVBoxLayout()
-        self.llama_layout.addWidget(QLabel("Llama Runners:"))
+        self.llama_layout = QHBoxLayout() # Use QHBoxLayout for side-by-side layout
 
-        self.model_buttons = {}
-        self.model_status_labels = {}
-        self.model_port_labels = {}
+        # Left side: Model List
+        self.model_list_widget = QListWidget()
+        self.model_list_widget.setMinimumWidth(150) # Give the list some space
+        self.llama_layout.addWidget(self.model_list_widget)
 
-        # Create a layout for model buttons and status
-        self.model_widgets_layout = QVBoxLayout()
+        # Right side: Model Status Stack
+        self.model_status_stack = QStackedWidget()
+        self.llama_layout.addWidget(self.model_status_stack)
 
-        for model_name, model_config in self.models.items():
-            model_button_layout = QVBoxLayout()
-            model_label = QLabel(f"<b>{model_name}</b>:") # Make model name bold
-            model_button_layout.addWidget(model_label)
+        self.model_status_widgets = {} # Store status widgets by model name
 
-            status_label = QLabel("Status: Not Running") # Add "Status: " prefix
-            model_button_layout.addWidget(status_label)
-            self.model_status_labels[model_name] = status_label
+        # Populate model list and create status widgets
+        for model_name in self.models.keys():
+            self.model_list_widget.addItem(model_name)
 
-            port_label = QLabel("Port: N/A")
-            model_button_layout.addWidget(port_label)
-            self.model_port_labels[model_name] = port_label
+            status_widget = ModelStatusWidget(model_name)
+            self.model_status_stack.addWidget(status_widget)
+            self.model_status_widgets[model_name] = status_widget
 
-            start_button = QPushButton(f"Start {model_name}")
-            # Use a lambda to pass the model_name to the slot
-            start_button.clicked.connect(lambda checked, name=model_name: self.start_llama_runner(name))
-            model_button_layout.addWidget(start_button)
-            self.model_buttons[model_name] = start_button
-
-            # Add a spacer or separator between model sections if needed
-            # self.model_widgets_layout.addLayout(model_button_layout)
-            # self.model_widgets_layout.addStretch() # Add stretch between models
-
-            # Add the model's layout to the main model widgets layout
-            self.model_widgets_layout.addLayout(model_button_layout)
+            # Connect signals from the status widget's buttons
+            # Use lambda to pass the model_name to the slots
+            status_widget.start_button.clicked.connect(lambda checked, name=model_name: self.start_llama_runner(name))
+            status_widget.stop_button.clicked.connect(lambda checked, name=model_name: self.stop_llama_runner(name))
 
 
-        self.stop_all_button = QPushButton("Stop All Llama Runners")
-        self.stop_all_button.clicked.connect(self.stop_all_llama_runners)
+        # Connect model list selection change
+        self.model_list_widget.currentItemChanged.connect(self.on_model_selection_changed)
 
-        # Add the model widgets layout and the stop all button to the main llama layout
-        self.llama_layout.addLayout(self.model_widgets_layout)
-        self.llama_layout.addStretch()  # Add stretch to push buttons to the top
-        self.llama_layout.addWidget(self.stop_all_button)
+        # Add a placeholder widget if no model is selected initially
+        self.no_model_selected_widget = QWidget()
+        no_model_layout = QVBoxLayout(self.no_model_selected_widget)
+        no_model_label = QLabel("Select a model from the list.")
+        no_model_label.setAlignment(Qt.AlignCenter)
+        no_model_layout.addWidget(no_model_label)
+        no_model_layout.addStretch()
+        self.model_status_stack.addWidget(self.no_model_selected_widget)
+        self.model_status_stack.setCurrentWidget(self.no_model_selected_widget) # Show placeholder initially
+
 
         self.llama_tab.setLayout(self.llama_layout)
         self.tabs.addTab(self.llama_tab, "Llama Runner")
@@ -381,9 +419,10 @@ class MainWindow(QWidget):
         self.litellm_layout.addWidget(self.litellm_status_label)
         self.litellm_start_button = QPushButton("Start LiteLLM Proxy")
         self.litellm_stop_button = QPushButton("Stop LiteLLM Proxy")
+        self.litellm_stop_button.setEnabled(False) # Initially disabled
         self.litellm_layout.addWidget(self.litellm_start_button)
         self.litellm_layout.addWidget(self.litellm_stop_button)
-        self.litellm_layout.addStretch() # Add stretch to push buttons to the top
+        self.litellm_layout.addStretch()
         self.litellm_tab.setLayout(self.litellm_layout)
         self.tabs.addTab(self.litellm_tab, "LiteLLM Proxy")
 
@@ -394,6 +433,10 @@ class MainWindow(QWidget):
         self.litellm_start_button.clicked.connect(self.start_litellm_proxy)
         self.litellm_stop_button.clicked.connect(self.stop_litellm_proxy)
 
+        # Connect signals from LlamaRunnerThreads (will be connected when threads are created)
+        # We need to connect these signals dynamically when a thread is started.
+
+
     def closeEvent(self, event):
         """
         Handles the window close event. Stops all running threads.
@@ -403,11 +446,10 @@ class MainWindow(QWidget):
         self.stop_litellm_proxy()
 
         # Give threads a moment to stop gracefully
-        # Note: This is a simple approach. A more robust shutdown might involve
-        # waiting for threads to finish using thread.wait() or similar,
-        # but doing so in the closeEvent can potentially freeze the UI
-        # if threads don't exit quickly. Signaling and letting them clean up
-        # in their run methods is generally preferred for responsiveness.
+        # A more robust shutdown might involve waiting for threads to finish
+        # using thread.wait() or similar, but doing so in the closeEvent
+        # can potentially freeze the UI if threads don't exit quickly.
+        # Signaling and letting them clean up in their run methods is generally preferred.
         # For this application's scale, a small sleep might be acceptable,
         # but relying on the threads' internal stop logic is better.
         # time.sleep(0.5) # Optional: brief pause
@@ -415,21 +457,65 @@ class MainWindow(QWidget):
         # Accept the close event to allow the window to close
         event.accept()
 
+    @Slot(str)
+    def on_model_selection_changed(self, current_item, previous_item):
+        """
+        Slot to handle selection changes in the model list.
+        Switches the stacked widget to show the selected model's status.
+        """
+        if current_item:
+            model_name = current_item.text()
+            if model_name in self.model_status_widgets:
+                self.model_status_stack.setCurrentWidget(self.model_status_widgets[model_name])
+            else:
+                 # Should not happen if list is populated from models dict
+                 logging.error(f"Status widget not found for selected model: {model_name}")
+                 self.model_status_stack.setCurrentWidget(self.no_model_selected_widget)
+        else:
+            # No item selected
+            self.model_status_stack.setCurrentWidget(self.no_model_selected_widget)
+
 
     def start_llama_runner(self, model_name: str):
         """
         Starts the LlamaCppRunner for a specific model in a separate thread.
+        Handles concurrent runner limit.
         """
         if model_name not in self.models:
             print(f"Model {model_name} not found in config.")
             return
 
-        # Stop any currently running instance of this model first
-        if model_name in self.llama_runner_threads and self.llama_runner_threads[model_name].isRunning():
-             print(f"Stopping existing Llama Runner for {model_name} before starting a new one.")
-             self.stop_llama_runner(model_name)
-             # Wait briefly for the stop to process signals if necessary
-             QApplication.processEvents() # Process events to allow stop signals to be handled
+        # Check current running runners
+        running_runners = {name: thread for name, thread in self.llama_runner_threads.items() if thread.isRunning()}
+        num_running = len(running_runners)
+
+        # If the requested model is already running, do nothing
+        if model_name in running_runners:
+             print(f"Llama Runner for {model_name} is already running.")
+             return
+
+        # Check concurrent runner limit
+        if num_running >= self.concurrent_runners_limit:
+            if self.concurrent_runners_limit == 1:
+                print(f"Concurrent runner limit ({self.concurrent_runners_limit}) reached. Stopping existing runner before starting {model_name}.")
+                # Stop the first running runner found (or all if limit is 1)
+                for name_to_stop in list(running_runners.keys()):
+                     self.stop_llama_runner(name_to_stop)
+                # Wait briefly for stop signals to process
+                QApplication.processEvents()
+                # Re-check if any are still running after attempting stop
+                running_after_stop = {name: thread for name, thread in self.llama_runner_threads.items() if thread.isRunning()}
+                if running_after_stop:
+                     print("Warning: Could not stop existing runner(s). Cannot start new runner.")
+                     QMessageBox.warning(self, "Concurrent Runner Limit",
+                                         f"Concurrent runner limit ({self.concurrent_runners_limit}) reached and could not stop existing runner(s).")
+                     return
+            else:
+                print(f"Concurrent runner limit ({self.concurrent_runners_limit}) reached. Cannot start {model_name}.")
+                QMessageBox.warning(self, "Concurrent Runner Limit",
+                                    f"Concurrent runner limit ({self.concurrent_runners_limit}) reached. Cannot start '{model_name}'.")
+                return
+
 
         model_config = self.models[model_name]
         model_path = model_config.get("model_path")
@@ -446,17 +532,17 @@ class MainWindow(QWidget):
              return
 
         # Check if the runtime executable exists if it's not the default "llama-server" (which is expected in PATH)
-        # Note: This check might be redundant now that LlamaCppRunner.start handles FileNotFoundError
-        # but keeping it here provides a quicker UI feedback for common errors.
         if llama_cpp_runtime_key != "default" and not os.path.exists(llama_cpp_runtime):
              QMessageBox.critical(self, "Runtime Not Found", f"Llama.cpp runtime not found: {llama_cpp_runtime}")
              return
 
 
         print(f"Starting Llama Runner for {model_name}...")
-        self.model_status_labels[model_name].setText("Status: Starting...")
-        self.model_buttons[model_name].setEnabled(False)
-        self.model_port_labels[model_name].setText("Port: N/A") # Clear old port
+        status_widget = self.model_status_widgets.get(model_name)
+        if status_widget:
+            status_widget.update_status("Starting...")
+            status_widget.update_port("N/A")
+            status_widget.set_buttons_enabled(False, False) # Disable both while starting
 
         thread = LlamaRunnerThread(
             model_name=model_name,
@@ -464,10 +550,9 @@ class MainWindow(QWidget):
             llama_cpp_runtime=llama_cpp_runtime,
             **model_config.get("parameters", {})
         )
-        # Connect signals using partial or lambda to pass model_name
+        # Connect signals
         thread.started.connect(lambda: self.on_llama_runner_started(model_name))
         thread.stopped.connect(lambda: self.on_llama_runner_stopped(model_name))
-        # Connect the error signal with the new signature
         thread.error.connect(lambda msg, output: self.on_llama_runner_error(model_name, msg, output))
         thread.port_ready.connect(lambda port: self.on_llama_runner_port_ready(model_name, port))
 
@@ -481,11 +566,10 @@ class MainWindow(QWidget):
         """
         if model_name in self.llama_runner_threads and self.llama_runner_threads[model_name].isRunning():
             print(f"Stopping Llama Runner for {model_name}...")
-            self.model_status_labels[model_name].setText("Status: Stopping...")
-            # Button should already be disabled, but ensure it is
-            self.model_buttons[model_name].setEnabled(False)
-            # Port label might still show the port until stopped signal
-            # self.model_port_labels[model_name].setText("Port: N/A") # Clear port immediately? Or wait for stopped?
+            status_widget = self.model_status_widgets.get(model_name)
+            if status_widget:
+                status_widget.update_status("Stopping...")
+                status_widget.set_buttons_enabled(False, False) # Disable both while stopping
 
             self.llama_runner_threads[model_name].stop()
             # Don't wait() here in the UI thread, it will freeze the UI.
@@ -581,11 +665,12 @@ class MainWindow(QWidget):
     def on_llama_runner_started(self, model_name: str):
         """
         Slot to handle the LlamaCppRunner started signal.
+        Updates UI status. Port update happens in on_llama_runner_port_ready.
         """
-        # Status is updated by port_ready, but we can ensure button is disabled
-        if model_name in self.model_buttons:
-             self.model_buttons[model_name].setEnabled(False)
-             self.model_status_labels[model_name].setText("Status: Starting...") # Update status to Starting if not already
+        status_widget = self.model_status_widgets.get(model_name)
+        if status_widget:
+             status_widget.update_status("Starting...")
+             status_widget.set_buttons_enabled(False, False) # Keep disabled until port is ready
 
 
     @Slot(str)
@@ -601,12 +686,11 @@ class MainWindow(QWidget):
             thread.deleteLater() # Schedule for deletion
 
             # Update UI for this model
-            if model_name in self.model_status_labels:
-                self.model_status_labels[model_name].setText("Status: Not Running")
-            if model_name in self.model_buttons:
-                self.model_buttons[model_name].setEnabled(True)
-            if model_name in self.model_port_labels:
-                self.model_port_labels[model_name].setText("Port: N/A")
+            status_widget = self.model_status_widgets.get(model_name)
+            if status_widget:
+                status_widget.update_status("Not Running")
+                status_widget.update_port("N/A")
+                status_widget.set_buttons_enabled(True, False) # Enable start, disable stop
         else:
             print(f"Stopped signal received for unknown or already cleaned up model: {model_name}")
 
@@ -630,9 +714,10 @@ class MainWindow(QWidget):
         error_dialog.exec() # Show the dialog modally
 
         # Update UI status for this model
-        if model_name in self.model_status_labels:
-            self.model_status_labels[model_name].setText("Status: Error")
-        # The stopped signal will follow and update the status to "Not Running" and re-enable the button
+        status_widget = self.model_status_widgets.get(model_name)
+        if status_widget:
+            status_widget.update_status("Error")
+            # The stopped signal will follow and update the status to "Not Running" and re-enable the start button
 
 
     @Slot(str, int) # Slot receives model_name and port
@@ -642,11 +727,11 @@ class MainWindow(QWidget):
         Updates the UI with the assigned port and status.
         """
         print(f"Llama Runner for {model_name} ready on port {port}.")
-        if model_name in self.model_port_labels:
-            self.model_port_labels[model_name].setText(f"Port: {port}")
-        if model_name in self.model_status_labels:
-            self.model_status_labels[model_name].setText("Status: Running")
-        # Button should already be disabled
+        status_widget = self.model_status_widgets.get(model_name)
+        if status_widget:
+            status_widget.update_port(port)
+            status_widget.update_status("Running")
+            status_widget.set_buttons_enabled(False, True) # Disable start, enable stop
 
 
 # The main function is now in main.py
