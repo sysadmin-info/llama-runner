@@ -389,6 +389,28 @@ class MainWindow(QWidget):
         self.litellm_start_button.clicked.connect(self.start_litellm_proxy)
         self.litellm_stop_button.clicked.connect(self.stop_litellm_proxy)
 
+    def closeEvent(self, event):
+        """
+        Handles the window close event. Stops all running threads.
+        """
+        print("MainWindow closing. Stopping all runners and proxy...")
+        self.stop_all_llama_runners()
+        self.stop_litellm_proxy()
+
+        # Give threads a moment to stop gracefully
+        # Note: This is a simple approach. A more robust shutdown might involve
+        # waiting for threads to finish using thread.wait() or similar,
+        # but doing so in the closeEvent can potentially freeze the UI
+        # if threads don't exit quickly. Signaling and letting them clean up
+        # in their run methods is generally preferred for responsiveness.
+        # For this application's scale, a small sleep might be acceptable,
+        # but relying on the threads' internal stop logic is better.
+        # time.sleep(0.5) # Optional: brief pause
+
+        # Accept the close event to allow the window to close
+        event.accept()
+
+
     def start_llama_runner(self, model_name: str):
         """
         Starts the LlamaCppRunner for a specific model in a separate thread.
