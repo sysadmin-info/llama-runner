@@ -46,7 +46,10 @@ class LlamaRunnerThread(QThread):
         self.is_running = True
         self._error_emitted = False # Reset flag
         try:
-            asyncio.run(self.run_async())
+            # Use a new event loop for this thread
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_until_complete(self.run_async())
         except Exception as e:
             # This catch is mostly for unexpected errors in the asyncio loop itself
             logging.error(f"Unexpected error in LlamaRunnerThread run: {e}\n{traceback.format_exc()}")
@@ -56,6 +59,11 @@ class LlamaRunnerThread(QThread):
         finally:
             self.is_running = False
             # The stopped signal is emitted in run_async's finally block
+            if hasattr(self, 'loop') and self.loop.is_running():
+                 self.loop.stop()
+            if hasattr(self, 'loop') and not self.loop.is_closed():
+                 self.loop.close()
+
 
     async def run_async(self):
         """
@@ -68,22 +76,18 @@ class LlamaRunnerThread(QThread):
                 llama_cpp_runtime=self.llama_cpp_runtime,
                 **self.kwargs
             )
+            # The start method now raises exceptions on failure
             await self.runner.start()
 
-            # Check if process started successfully
-            if not self.runner.process or self.runner.process.poll() is not None:
-                 raise RuntimeError("Llama.cpp server process failed to start.")
-
-            startup_success = await self.runner.wait_for_server_startup()
-
             # Check if startup message was found and port was set
-            if not startup_success or self.runner.port is None:
-                 # Check if the process exited during startup wait
-                 if self.runner.process.poll() is not None:
-                     return_code = self.runner.process.returncode
-                     raise RuntimeError(f"Llama.cpp server exited during startup with code {return_code}.")
-                 else:
-                     raise RuntimeError("Llama.cpp server startup message not found or port not extracted.")
+            # The runner.start() method now handles the case where the process exits immediately
+            # This check is for cases where the process starts but doesn't print the expected line
+            if self.runner.port is None:
+                 last_line = self.runner.get_last_output_line()
+                 error_msg = "Llama.cpp server startup message not found or port not extracted."
+                 if last_line:
+                     error_msg += f" Last output line: '{last_line}'"
+                 raise RuntimeError(error_msg)
 
 
             self.started.emit()
@@ -117,8 +121,12 @@ class LlamaRunnerThread(QThread):
 
             # Check the final return code after ensuring the process is stopped
             # Only emit error if one hasn't been emitted by the except block
+            # Check self.runner.process exists before accessing returncode
             if not self._error_emitted and self.runner and self.runner.process and self.runner.process.returncode != 0:
                 error_message = f"Llama.cpp server for {self.model_name} exited with code {self.runner.process.returncode}"
+                last_line = self.runner.get_last_output_line()
+                if last_line:
+                    error_message += f". Last output line: '{last_line}'"
                 logging.error(error_message)
                 self.error.emit(error_message)
                 self._error_emitted = True # Set flag
@@ -133,6 +141,14 @@ class LlamaRunnerThread(QThread):
         The actual stopping happens in run_async.
         """
         self.is_running = False
+        # If the asyncio loop is running, schedule the stop coroutine
+        if hasattr(self, 'loop') and self.loop.is_running():
+             asyncio.run_coroutine_threadsafe(self._request_stop_runner(), self.loop)
+
+    async def _request_stop_runner(self):
+        """Helper coroutine to request runner stop from within the thread's loop."""
+        if self.runner:
+            await self.runner.stop()
 
 
 class LiteLLMProxyThread(QThread):
@@ -153,11 +169,18 @@ class LiteLLMProxyThread(QThread):
         """
         self.is_running = True
         try:
-            asyncio.run(self.run_async())
+            # Use a new event loop for this thread
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_until_complete(self.run_async())
         except Exception as e:
             logging.error(f"Unexpected error in LiteLLMProxyThread run: {e}\n{traceback.format_exc()}")
         finally:
             self.is_running = False
+            if hasattr(self, 'loop') and self.loop.is_running():
+                 self.loop.stop()
+            if hasattr(self, 'loop') and not self.loop.is_closed():
+                 self.loop.close()
 
 
     async def run_async(self):
@@ -312,7 +335,7 @@ class MainWindow(QWidget):
         self.litellm_stop_button = QPushButton("Stop LiteLLM Proxy")
         self.litellm_layout.addWidget(self.litellm_start_button)
         self.litellm_layout.addWidget(self.litellm_stop_button)
-        self.litellm_layout.addStretch() # Add stretch to push buttons to the top
+        selfellm_layout.addStretch() # Add stretch to push buttons to the top
         self.litellm_tab.setLayout(self.litellm_layout)
         self.tabs.addTab(self.litellm_tab, "LiteLLM Proxy")
 
@@ -353,6 +376,8 @@ class MainWindow(QWidget):
              return
 
         # Check if the runtime executable exists if it's not the default "llama-server" (which is expected in PATH)
+        # Note: This check might be redundant now that LlamaCppRunner.start handles FileNotFoundError
+        # but keeping it here provides a quicker UI feedback for common errors.
         if llama_cpp_runtime_key != "default" and not os.path.exists(llama_cpp_runtime):
              QMessageBox.critical(self, "Runtime Not Found", f"Llama.cpp runtime not found: {llama_cpp_runtime}")
              return
@@ -424,9 +449,11 @@ class MainWindow(QWidget):
         # Find the first running Llama Runner to connect to
         running_model_name = None
         running_port = None
-        for model_name, thread in self.llama_runner_threads.items():
+        # Iterate over a copy of items to avoid issues if a thread stops during iteration
+        for model_name, thread in list(self.llama_runner_threads.items()):
             # Check if the thread is running AND the runner instance exists AND has a port
-            if thread.isRunning() and thread.runner is not None and thread.runner.get_port() is not None:
+            # Also check if the underlying process is still alive
+            if thread.isRunning() and thread.runner is not None and thread.runner.is_running() and thread.runner.get_port() is not None:
                 running_model_name = model_name
                 running_port = thread.runner.get_port()
                 break

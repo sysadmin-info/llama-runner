@@ -30,6 +30,7 @@ class LlamaCppRunner:
         self.process: subprocess.Popen = None
         self.startup_pattern = re.compile(r"main: server is listening on")  # Regex to detect startup
         self.port = None #Dynamically assigned port
+        self._last_output_line = None # Store the last line read from stdout
 
     async def start(self):
         """
@@ -50,77 +51,167 @@ class LlamaCppRunner:
         # Add additional arguments from kwargs
         for key, value in self.kwargs.items():
             arg_name = key.replace("_", "-")  # Convert snake_case to kebab-case
-            command.append(f"--{arg_name}")
-            command.append(str(value))
+            # Handle boolean flags: if value is True, just add the flag, otherwise skip
+            if isinstance(value, bool):
+                if value:
+                    command.append(f"--{arg_name}")
+                # If value is False, do nothing (don't add --no-flag unless explicitly handled)
+            else:
+                command.append(f"--{arg_name}")
+                command.append(str(value))
+
 
         print(f"Starting llama.cpp server with command: {' '.join(command)}")
         logging.info(f"Starting llama.cpp server with command: {' '.join(command)}")
 
         try:
-            self.process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                cwd=CONFIG_DIR  # Run in the config directory
+            # Use asyncio.create_subprocess_exec for better integration with asyncio
+            # Need to capture stdout/stderr for reading
+            self.process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT, # Merge stderr into stdout
+                cwd=CONFIG_DIR
             )
+            print(f"Process started with PID: {self.process.pid}")
 
-            await self.wait_for_server_startup()
+            # Wait for startup message
+            startup_success = await self.wait_for_server_startup()
 
-        except OSError as e:
-            print(f"Error starting llama.cpp server: {e}")
-            logging.error(f"Error starting llama.cpp server: {e}")
+            # If startup wasn't successful, check if the process exited immediately
+            if not startup_success and self.process.returncode is not None:
+                 # Process exited before startup message
+                 error_msg = f"Llama.cpp server for {self.model_name} exited immediately with code {self.process.returncode}."
+                 if self._last_output_line:
+                     error_msg += f" Last output: '{self._last_output_line}'"
+                 raise RuntimeError(error_msg)
+
+            # If startup_success is False here, it means the process is running but didn't print the expected line
+            # This case is handled in wait_for_server_startup by returning False
+
+        except FileNotFoundError:
+            error_msg = f"Error: Llama.cpp runtime not found at '{self.llama_cpp_runtime}'. Make sure it's in your PATH or the path is correct."
+            print(error_msg)
+            logging.error(error_msg)
+            # Set process to None to indicate failure before process creation
+            self.process = None
+            raise RuntimeError(error_msg) # Re-raise to be caught by the thread
+        except Exception as e:
+            error_msg = f"Error starting llama.cpp server process: {e}"
+            print(error_msg)
+            logging.error(error_msg)
+            # Ensure process is None if startup failed before wait_for_server_startup
+            if self.process and self.process.returncode is None:
+                 try:
+                     self.process.terminate()
+                     await asyncio.wait_for(self.process.wait(), timeout=5)
+                 except:
+                     self.process.kill()
+                 self.process = None
+            elif self.process and self.process.returncode is not None:
+                 # Process started but exited quickly
+                 pass # Handled above if startup_success is False
+            else:
+                 self.process = None # Ensure process is None on other errors
+            raise RuntimeError(error_msg) # Re-raise to be caught by the thread
+
 
     async def wait_for_server_startup(self):
         """
         Waits for the llama.cpp server to start up, using a regex pattern.
+        Reads stdout line by line.
         """
         if not self.process or not self.process.stdout:
+            print("Process or stdout not available to wait for startup.")
             return False
 
-        while True:
-            line = await asyncio.get_event_loop().run_in_executor(None, self.process.stdout.readline)
-            if not line:
-                break  # Process ended
+        print(f"Waiting for startup message for {self.model_name}...")
+        try:
+            while True:
+                # Read a line with a timeout to prevent infinite blocking
+                try:
+                    line = await asyncio.wait_for(self.process.stdout.readline(), timeout=1.0) # Read line with timeout
+                except asyncio.TimeoutError:
+                    # Check if process is still running during timeout
+                    if self.process.returncode is not None:
+                        print(f"Process for {self.model_name} exited while waiting for output.")
+                        return False # Process exited
 
-            print(f"llama.cpp[{self.model_name}]: {line.strip()}")
-            match = self.startup_pattern.search(line)
-            if match:
-                print(f"llama.cpp server for {self.model_name} started successfully.")
-                 # Extract port from the startup message
-                match = re.search(r'http://127\.0\.0\.1:(\d+)', line)
+                    # If process is still running, continue waiting for output
+                    continue # Go back to the start of the while loop to try reading again
+
+                if not line:
+                    # End of stream reached, process likely exited
+                    print(f"End of stdout stream reached for {self.model_name}. Process likely exited.")
+                    return False
+
+                decoded_line = line.decode('utf-8', errors='replace').strip()
+                self._last_output_line = decoded_line # Store the last line
+
+                print(f"llama.cpp[{self.model_name}]: {decoded_line}")
+
+                match = self.startup_pattern.search(decoded_line)
                 if match:
-                    self.port = int(match.group(1))
-                    print(f"llama.cpp server for {self.model_name} is listening on port {self.port}")
-                return True
-            if self.process.poll() is not None:
-                print(f"llama.cpp server for {self.model_name} exited before startup.")
-                return False
+                    print(f"llama.cpp server for {self.model_name} started successfully.")
+                    # Extract port from the startup message
+                    port_match = re.search(r'http://127\.0\.0\.1:(\d+)', decoded_line)
+                    if port_match:
+                        self.port = int(port_match.group(1))
+                        print(f"llama.cpp server for {self.model_name} is listening on port {self.port}")
+                    else:
+                         # Startup line found, but port not extracted - this is also a failure
+                         print(f"Warning: Startup line found but port could not be extracted for {self.model_name}.")
+                         return False # Indicate failure if port isn't found
 
-        return False
+                    return True # Startup successful
+
+                # Check if process exited after reading a line
+                if self.process.returncode is not None:
+                    print(f"Process for {self.model_name} exited after reading a line.")
+                    return False # Process exited
+
+        except Exception as e:
+            print(f"Error during startup wait for {self.model_name}: {e}")
+            logging.error(f"Error during startup wait for {self.model_name}: {e}")
+            return False # Indicate failure
+
 
     async def stop(self):
         """
         Stops the llama.cpp server.
         """
-        if self.process and self.process.poll() is None:
-            print(f"Stopping llama.cpp server for {self.model_name}.")
-            self.process.terminate()
+        if self.process and self.process.returncode is None: # Check if process is running
+            print(f"Stopping llama.cpp server for {self.model_name} (PID: {self.process.pid}).")
             try:
-                await asyncio.wait_for(asyncio.get_event_loop().run_in_executor(None, self.process.wait), timeout=15)
+                self.process.terminate()
+                # Wait for the process to terminate gracefully
+                await asyncio.wait_for(self.process.wait(), timeout=15)
+                print(f"llama.cpp server for {self.model_name} terminated gracefully.")
             except asyncio.TimeoutError:
                 print(f"llama.cpp server for {self.model_name} did not terminate in 15 seconds, killing it.")
-                self.process.kill()
-            self.process = None
+                try:
+                    self.process.kill()
+                    await asyncio.wait_for(self.process.wait(), timeout=5) # Wait a bit for kill
+                except Exception as kill_e:
+                    print(f"Error killing process {self.process.pid}: {kill_e}")
+            except Exception as e:
+                 print(f"Error during process termination for {self.model_name}: {e}")
+
+            self.process = None # Clear the process reference after stopping
             print(f"llama.cpp server for {self.model_name} stopped.")
+        elif self.process and self.process.returncode is not None:
+             print(f"llama.cpp server for {self.model_name} was already stopped (code {self.process.returncode}).")
+             self.process = None # Ensure process reference is cleared
         else:
-            print(f"llama.cpp server for {self.model_name} is not running.")
+            print(f"llama.cpp server for {self.model_name} is not running (no process).")
+            self.process = None # Ensure process reference is cleared
+
 
     def is_running(self):
         """
-        Checks if the llama.cpp server is running.
+        Checks if the llama.cpp server process is running.
         """
-        return self.process is not None and self.process.poll() is None
+        return self.process is not None and self.process.returncode is None
 
     def get_port(self):
         """
@@ -128,30 +219,16 @@ class LlamaCppRunner:
         """
         return self.port
 
-async def main():
-    """
-    Main function to demonstrate the usage of LlamaCppRunner.
-    """
-    config = load_config()
-    llama_runtimes = config.get("llama-runtimes", {})
-    default_runtime = "llama-server"  # Default to llama-server from PATH
+    def get_last_output_line(self):
+        """
+        Returns the last line read from the process's stdout during startup wait.
+        """
+        return self._last_output_line
 
-    # Load model-specific config, if available
-    model_name = "test-model" # hardcoded for now
-    model_config = config.get("models", {}).get(model_name, {})
-    model_path = model_config.get("model_path")
-    llama_cpp_runtime = llama_runtimes.get(model_config.get("llama_cpp_runtime", "default"), default_runtime)
 
-    runner = LlamaCppRunner(
-        model_name=model_name,
-        model_path=model_path,
-        llama_cpp_runtime=llama_cpp_runtime,
-        **model_config.get("parameters", {})
-    )
-
-    await runner.start()
-    # await asyncio.sleep(10)  # Run for 10 seconds # REMOVE THIS LINE
-    # await runner.stop() # REMOVE THIS LINE
+# The main function is now in main.py
+# async def main():
+#    pass # REMOVE
 
 # if __name__ == "__main__": # REMOVE THIS LINE
 #    asyncio.run(main()) # REMOVE THIS LINE
