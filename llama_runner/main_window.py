@@ -479,7 +479,7 @@ class MainWindow(QWidget):
     def start_llama_runner(self, model_name: str):
         """
         Starts the LlamaCppRunner for a specific model in a separate thread.
-        Handles concurrent runner limit.
+        Handles concurrent runner limit and waits for previous runners to stop.
         """
         if model_name not in self.models:
             print(f"Model {model_name} not found in config.")
@@ -499,17 +499,29 @@ class MainWindow(QWidget):
             if self.concurrent_runners_limit == 1:
                 print(f"Concurrent runner limit ({self.concurrent_runners_limit}) reached. Stopping existing runner before starting {model_name}.")
                 # Stop the first running runner found (or all if limit is 1)
-                for name_to_stop in list(running_runners.keys()):
+                stopped_successfully = True
+                for name_to_stop, thread_to_stop in list(running_runners.items()):
                      self.stop_llama_runner(name_to_stop)
-                # Wait briefly for stop signals to process
-                QApplication.processEvents()
-                # Re-check if any are still running after attempting stop
-                running_after_stop = {name: thread for name, thread in self.llama_runner_threads.items() if thread.isRunning()}
-                if running_after_stop:
-                     print("Warning: Could not stop existing runner(s). Cannot start new runner.")
-                     QMessageBox.warning(self, "Concurrent Runner Limit",
-                                         f"Concurrent runner limit ({self.concurrent_runners_limit}) reached and could not stop existing runner(s).")
-                     return
+                     # Wait for the thread to actually stop
+                     timeout_seconds = 15
+                     start_time = time.time()
+                     while thread_to_stop.isRunning() and (time.time() - start_time) < timeout_seconds:
+                         QApplication.processEvents() # Keep UI responsive
+                         time.sleep(0.1) # Wait a bit
+
+                     if thread_to_stop.isRunning():
+                         print(f"Error: Llama Runner for {name_to_stop} did not stop within {timeout_seconds} seconds.")
+                         QMessageBox.critical(self, "Stop Error",
+                                              f"Failed to stop existing runner for '{name_to_stop}' within {timeout_seconds} seconds. Cannot start new runner.")
+                         stopped_successfully = False
+                         # Don't try to stop others, just report the failure and exit
+                         break
+                     else:
+                         print(f"Llama Runner for {name_to_stop} stopped successfully.")
+
+                if not stopped_successfully:
+                     return # Exit if any runner failed to stop
+
             else:
                 print(f"Concurrent runner limit ({self.concurrent_runners_limit}) reached. Cannot start {model_name}.")
                 QMessageBox.warning(self, "Concurrent Runner Limit",
@@ -592,6 +604,10 @@ class MainWindow(QWidget):
         # Iterate over a copy of the keys because stop_llama_runner modifies the dict
         for model_name in list(self.llama_runner_threads.keys()):
             self.stop_llama_runner(model_name)
+            # Add a small delay between stopping multiple runners if needed,
+            # but the wait logic in start_llama_runner is more critical.
+            # time.sleep(0.1) # Optional: brief pause
+
 
     def start_litellm_proxy(self):
         """
