@@ -303,60 +303,6 @@ class MainWindow(QWidget):
 #     window.show()
 #
 #     # Start the event loop
-#     sys.exit(qt_app.exec())
-#
-#
-# if __name__ == "__main__":
-#     # The main function now runs the Qt event loop synchronously.
-#     # Async tasks will be handled within the Qt application's lifecycle.
-#     main()
-# </source>
-</code>
-
-main.py
-<code>python
-<<<<<<< SEARCH
-import sys
-from PySide6.QtWidgets import QApplication
-from llama_runner.main_window import MainWindow
-
-def main():
-    # Create the Qt application
-    app = QApplication(sys.argv)
-
-    # Create the main window
-    window = MainWindow()
-    window.show()
-
-    # Start the event loop
-    sys.exit(app.exec())
-
-if __name__ == "__main__":
-    main()
-</python>
-
-Next, I will modify the `main.py` file to:
-
-1.  Import the `MainWindow` class from `llama_runner/main_window.py`.
-2.  Create an instance of the `QApplication` and `MainWindow`.
-3.  Show the main window.
-4.  Move the LlamaCppRunner and LiteLLM proxy logic to be managed by the UI.
-
-Here's the first *SEARCH/REPLACE* block to modify the `main.py` file:
-
-main.py
-<source>python
-<<<<<<< SEARCH
-import asyncio
-import os
-import tempfile
-import yaml
-import logging
-from litellm.proxy.proxy_server import app
-import uvicorn
-
-from llama_runner.config_loader import load_config
-from llama_runner.llama_cpp_runner import LlamaCppRunner, CONFIG_DIR
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
