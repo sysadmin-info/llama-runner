@@ -79,9 +79,8 @@ class LlamaRunnerThread(QThread):
         finally:
             if self.runner:
                 await self.runner.stop()
-        finally:
-            self.is_running = False
-            self.stopped.emit()
+        self.is_running = False
+        self.stopped.emit()
 
     def stop(self):
         """
