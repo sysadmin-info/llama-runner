@@ -249,8 +249,16 @@ class MainWindow(QWidget):
         """
         Starts the LiteLLM proxy in a separate thread.
         """
+        if self.llama_runner_thread is None or not self.llama_runner_thread.isRunning():
+            print("Llama Runner must be started first.")
+            return
+
+        if self.llama_runner_thread.runner is None:
+            print("Llama Runner is still initializing.")
+            return
+
         if self.litellm_proxy_thread is None or not self.litellm_proxy_thread.isRunning():
-            self.litellm_proxy_thread = LiteLLMProxyThread()
+            self.litellm_proxy_thread = LiteLLMProxyThread(model_name=self.model_name, llama_cpp_port=self.llama_runner_thread.runner.get_port())
             self.litellm_proxy_thread.start()
             self.litellm_status_label.setText("Running...")
         else:
