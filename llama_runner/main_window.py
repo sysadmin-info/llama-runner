@@ -7,6 +7,7 @@ import yaml
 import logging
 import traceback
 import time
+from typing import Optional # Import Optional
 
 from litellm.proxy.proxy_server import app # Keep import for potential future direct interaction if needed
 import uvicorn # Keep import if needed elsewhere, but proxy thread handles server
