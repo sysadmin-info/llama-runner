@@ -12,7 +12,7 @@ from typing import Dict, Any, Callable, List, Optional
 from litellm.proxy.proxy_server import app # Import the global FastAPI app instance
 import uvicorn
 from fastapi import HTTPException, Request, Response, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse # Import RedirectResponse
 import httpx # Import httpx for forwarding requests
 
 from PySide6.QtCore import QThread, QObject, Signal, Slot, QTimer # Import QTimer for potential use
@@ -90,7 +90,19 @@ async def _dynamic_route_v1_request(request: Request):
     # For now, assume the model name is in the request JSON body under the 'model' key.
     # Need to read the body without consuming it for the downstream request.
     try:
-        body = await request.json()
+        # Read body bytes first, then attempt to parse as JSON
+        body_bytes = await request.body()
+        body = {}
+        try:
+            if body_bytes:
+                body = json.loads(body_bytes)
+        except json.JSONDecodeError:
+            logging.warning(f"Could not decode request body as JSON for {request.url.path}")
+            # Continue without body if JSON parsing fails, maybe model is in path or headers?
+            # For now, assume model is required in body for these endpoints.
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON request body.")
+
+
         model_name = body.get("model")
         if not model_name:
              # If model is not in body, try path parameters if applicable (less common for v1)
@@ -98,9 +110,12 @@ async def _dynamic_route_v1_request(request: Request):
              logging.warning(f"Model name not found in request body for {request.url.path}")
              raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Model name not specified in request body.")
 
+    except HTTPException:
+         # Re-raise HTTPException if already set
+         raise
     except Exception as e:
         logging.error(f"Error reading request body or extracting model name: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid request body: {e}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid request: {e}")
 
     logging.debug(f"Intercepted request for model: {model_name} at path: {request.url.path}")
 
@@ -161,6 +176,7 @@ async def _dynamic_route_v1_request(request: Request):
 
 
     # Runner is ready and port is known. Forward the request.
+    # Construct the target URL using the known port and the original request path
     target_url = f"http://127.0.0.1:{port}{request.url.path}"
     logging.debug(f"Forwarding request for {model_name} to {target_url}")
 
@@ -170,31 +186,23 @@ async def _dynamic_route_v1_request(request: Request):
             # Reconstruct headers, removing host and potentially others that shouldn't be forwarded
             headers = dict(request.headers)
             headers.pop('host', None) # Remove host header
+            # Remove content-length header as httpx will set it correctly based on the forwarded content
+            headers.pop('content-length', None)
+
 
             # Forward the request, including method, URL path, headers, and body
-            # Need to read the body again as request.json() consumed it once
-            # Use request.stream() to read the body bytes
-            body_bytes = await request.body()
-
-            # Use stream=True for potentially large responses (like streaming completions)
-            # This allows httpx to return an async iterator for the response body
+            # Use the body_bytes read earlier
             proxy_response = await client.request(
                 method=request.method,
                 url=target_url,
                 headers=headers,
                 content=body_bytes, # Pass the raw body bytes
                 timeout=600.0, # Use a generous timeout for model responses
-                # stream=True # Enable streaming response handling
+                # stream=True # Enable streaming response handling - httpx handles this automatically with async iteration
             )
 
             # Check if the response is streaming (e.g., Server-Sent Events)
             # This requires inspecting headers like 'content-type'
-            # For simplicity, let's assume streaming if the original request was for chat completions
-            # and the response content type is text/event-stream.
-            # A more robust check would be needed for other streaming endpoints.
-
-            # If the response is streaming, return a StreamingResponse
-            # Check content-type header from the proxy_response
             content_type = proxy_response.headers.get('content-type', '').lower()
             if 'text/event-stream' in content_type:
                  logging.debug(f"Forwarding streaming response from {target_url}")
@@ -224,6 +232,23 @@ async def _dynamic_route_v1_request(request: Request):
 
 # --- End new handler ---
 
+# --- New handlers for /api/v0/* redirects ---
+async def _redirect_v0_chat_completions(request: Request):
+    """Redirects /api/v0/chat/completions to /v1/chat/completions."""
+    logging.debug("Redirecting /api/v0/chat/completions to /v1/chat/completions")
+    return RedirectResponse(url="/v1/chat/completions", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+async def _redirect_v0_completions(request: Request):
+    """Redirects /api/v0/completions to /v1/completions."""
+    logging.debug("Redirecting /api/v0/completions to /v1/completions")
+    return RedirectResponse(url="/v1/completions", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+async def _redirect_v0_embeddings(request: Request):
+    """Redirects /api/v0/embeddings to /v1/embeddings."""
+    logging.debug("Redirecting /api/v0/embeddings to /v1/embeddings")
+    return RedirectResponse(url="/v1/embeddings", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+# --- End new handlers ---
+
 
 # Add LM Studio compatible routes to the global FastAPI app instance
 # Check if routes already exist to avoid adding them multiple times
@@ -233,9 +258,23 @@ if "/api/v0/models" not in existing_routes:
      logging.info("Adding LM Studio compatible API routes.")
      app.add_api_route("/api/v0/models", _get_lmstudio_models_handler, methods=["GET"])
      app.add_api_route("/api/v0/models/{model_id}", _get_lmstudio_model_handler, methods=["GET"])
-     # Add redirects if necessary - relying on LiteLLM defaults for now
 else:
      logging.info("LM Studio compatible API routes already exist.")
+
+# --- Add redirect routes for /api/v0/* endpoints ---
+# Add these *before* the /v1/* dynamic routing handlers if possible,
+# although the paths are distinct so order shouldn't strictly matter here.
+if "/api/v0/chat/completions" not in existing_routes:
+    app.add_api_route("/api/v0/chat/completions", _redirect_v0_chat_completions, methods=["POST"])
+    logging.info("Added redirect handler for /api/v0/chat/completions.")
+if "/api/v0/completions" not in existing_routes:
+    app.add_api_route("/api/v0/completions", _redirect_v0_completions, methods=["POST"])
+    logging.info("Added redirect handler for /api/v0/completions.")
+if "/api/v0/embeddings" not in existing_routes:
+    app.add_api_route("/api/v0/embeddings", _redirect_v0_embeddings, methods=["POST"])
+    logging.info("Added redirect handler for /api/v0/embeddings.")
+# --- End add redirect routes ---
+
 
 # --- Add routes for /v1/* endpoints to be intercepted ---
 # Use a path parameter to capture the rest of the path after /v1
@@ -249,14 +288,6 @@ else:
 # Inspecting `app.routes` might be necessary to ensure our routes take precedence.
 # For simplicity, let's assume adding them here works.
 
-# Check if /v1 routes already exist (e.g., added by LiteLLM)
-# This check is complex because LiteLLM might add routes like /v1/chat/completions directly.
-# A simpler approach is to add our catch-all /v1/{path:path} route and ensure it's processed first.
-# FastAPI processes routes in the order they are added.
-
-# Let's add specific routes for the common endpoints first, then a catch-all if needed.
-# This is safer than a broad catch-all if LiteLLM adds other /v1 routes we don't want to intercept.
-
 # Check if specific /v1 routes exist before adding our dynamic handler
 v1_routes_to_intercept = ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"]
 our_v1_routes_added = False
@@ -268,11 +299,18 @@ our_v1_routes_added = False
 
 # Add specific routes for common /v1 endpoints
 # The handler will extract the model name from the request body
-app.add_api_route("/v1/chat/completions", _dynamic_route_v1_request, methods=["POST"])
-app.add_api_route("/v1/completions", _dynamic_route_v1_request, methods=["POST"]) # Completions is usually POST
-app.add_api_route("/v1/embeddings", _dynamic_route_v1_request, methods=["POST"]) # Embeddings is usually POST
-logging.info("Added dynamic routing handlers for /v1/chat/completions, /v1/completions, /v1/embeddings.")
-our_v1_routes_added = True
+# Check if our dynamic handlers are already added to avoid duplicates on reload/restart
+# This check is fragile, a better approach might be needed if routes are added dynamically elsewhere
+dynamic_v1_paths = ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"]
+if not any(path in existing_routes for path in dynamic_v1_paths):
+    app.add_api_route("/v1/chat/completions", _dynamic_route_v1_request, methods=["POST"])
+    app.add_api_route("/v1/completions", _dynamic_route_v1_request, methods=["POST"]) # Completions is usually POST
+    app.add_api_route("/v1/embeddings", _dynamic_route_v1_request, methods=["POST"]) # Embeddings is usually POST
+    logging.info("Added dynamic routing handlers for /v1/chat/completions, /v1/completions, /v1/embeddings.")
+    our_v1_routes_added = True
+else:
+    logging.info("Dynamic routing handlers for /v1/* already exist.")
+
 
 # If needed, add a catch-all for other /v1 paths, but be cautious
 # app.add_api_route("/v1/{path:path}", _dynamic_route_v1_request, methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -359,7 +397,6 @@ class LiteLLMProxyThread(QThread):
         """
         self.is_running = True
         try:
-            # Use a new event loop for this thread
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
 
@@ -476,4 +513,3 @@ class LiteLLMProxyThread(QThread):
             # This might not immediately stop the serve() call.
             # A more robust stop might involve sending a signal or using a shutdown event.
             # For now, setting should_exit is the standard uvicorn way.
-
