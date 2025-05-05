@@ -188,10 +188,11 @@ class LiteLLMProxyThread(QThread):
     """
     QThread to run the LiteLLM proxy in a separate thread.
     """
-    def __init__(self, model_name: str, llama_cpp_port: int):
+    def __init__(self, model_name: str, llama_cpp_port: int, api_key: str = None):
         super().__init__()
         self.model_name = model_name
         self.llama_cpp_port = llama_cpp_port
+        self.api_key = api_key # Store the optional API key
         self.process = None # LiteLLM proxy is run embedded, not as a separate process
         self.is_running = False
         self._uvicorn_server = None # Hold reference to the uvicorn server
@@ -231,14 +232,20 @@ class LiteLLMProxyThread(QThread):
                             # Use 'openai' provider and point api_base to the llama.cpp server
                             "model": "openai/gpt-3.5-turbo", # Use openai provider, model name can be anything for openai-compatible
                             "api_base": f"http://127.0.0.1:{self.llama_cpp_port}"
-                            # Removed "custom_llm_provider": "llama_cpp"
                         }
                     }
                 ],
                 "general_settings": {
-                    "master_key": "sk-xxx" # Placeholder
+                    # Include master_key only if an API key was provided
                 }
             }
+
+            if self.api_key:
+                 proxy_config["general_settings"]["master_key"] = self.api_key
+                 print("LiteLLM Proxy configured with API Key authentication.")
+            else:
+                 print("LiteLLM Proxy configured without API Key authentication.")
+
 
             # 2. Dump to a temp YAML file
             # Use a persistent temp file that we can clean up later
@@ -300,6 +307,9 @@ class MainWindow(QWidget):
         self.llama_runtimes = self.config.get("llama-runtimes", {})
         self.default_runtime = "llama-server"  # Default to llama-server from PATH
         self.models = self.config.get("models", {})
+        # Get LiteLLM proxy config
+        self.litellm_proxy_config = self.config.get("litellm-proxy", {})
+
 
         self.llama_runner_threads = {}  # Dictionary to store threads for each model
         self.litellm_proxy_thread = None
@@ -502,8 +512,14 @@ class MainWindow(QWidget):
         self.litellm_start_button.setEnabled(False)
         self.litellm_stop_button.setEnabled(True)
 
+        # Get the optional API key from the config
+        proxy_api_key = self.litellm_proxy_config.get("api_key")
 
-        self.litellm_proxy_thread = LiteLLMProxyThread(model_name=running_model_name, llama_cpp_port=running_port)
+        self.litellm_proxy_thread = LiteLLMProxyThread(
+            model_name=running_model_name,
+            llama_cpp_port=running_port,
+            api_key=proxy_api_key # Pass the API key to the thread
+        )
         # LiteLLM proxy thread doesn't currently have error/stopped signals, could add later
         self.litellm_proxy_thread.start()
 
