@@ -10,7 +10,7 @@ from typing import Dict, Any, Callable, Optional
 import httpx
 
 # Third-party imports
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 

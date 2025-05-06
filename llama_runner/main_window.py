@@ -1,36 +1,21 @@
-import sys
 import asyncio
-import subprocess
 import os
-import tempfile
-import yaml
 import logging
 import traceback
-import time
-from typing import Optional, Dict, Any, Callable, List # Import Callable
-
-# Attempt to import asyncio_qt for bridging
-try:
-    from asyncio_qt import QEventLoop
-    ASYNCIO_QT_AVAILABLE = True
-    logging.debug("Successfully imported asyncio_qt. Using QEventLoop.")
-except ImportError:
-    logging.warning("The 'asyncio_qt' library is not installed. Asyncio-Qt bridging may not work correctly.")
-    ASYNCIO_QT_AVAILABLE = False
+from typing import Optional, Dict, Any # Import Callable
 
 # Removed: from litellm.proxy.proxy_server import app
-import uvicorn # Keep import if needed elsewhere, but proxy thread handles server
 
-from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                               QPushButton, QLineEdit, QMessageBox,
-                               QDialog, QTextEdit, QDialogButtonBox, QListWidget,
-                               QStackedWidget, QSizePolicy, QSpacerItem)
-from PySide6.QtCore import QThread, QObject, Signal, Slot, Qt, QTimer # Import QTimer
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                               QPushButton, QDialog, QTextEdit, QDialogButtonBox, QListWidget,
+                               QStackedWidget, QSizePolicy)
+from PySide6.QtCore import QThread, Signal, Slot, Qt, QTimer # Import QTimer
 
 from llama_runner.config_loader import load_config
 from llama_runner.llama_cpp_runner import LlamaCppRunner
 # Updated import: Import FastAPIProxyThread
-from llama_runner.lite_llm_proxy_thread import FastAPIProxyThread # Import the proxy thread from its new file
+from llama_runner.lmstudio_proxy_thread import FastAPIProxyThread # Import the FastAPI proxy thread
+from llama_runner.ollama_proxy_thread import OllamaProxyThread # Import the Ollama proxy thread
 from llama_runner import gguf_metadata # Import the new metadata module
 
 # Configure logging
@@ -338,6 +323,7 @@ class MainWindow(QWidget):
         self.llama_runner_threads: Dict[str, LlamaRunnerThread] = {}  # Dictionary to store threads for each model
         # Updated type hint for proxy thread
         self.fastapi_proxy_thread: Optional[FastAPIProxyThread] = None
+        self.ollama_proxy_thread: Optional[OllamaProxyThread] = None # Add Ollama proxy thread instance
 
         # Dictionary to hold asyncio Futures for runners that are starting
         # Key: model_name, Value: asyncio.Future
@@ -402,6 +388,10 @@ class MainWindow(QWidget):
         self.start_fastapi_proxy() # Updated method call
         # --- End automatic proxy start ---
 
+        # --- Start the Ollama Proxy automatically ---
+        self.start_ollama_proxy() # Add method call to start Ollama proxy
+        # --- End automatic proxy start ---
+
 
     def closeEvent(self, event):
         """
@@ -410,6 +400,7 @@ class MainWindow(QWidget):
         print("MainWindow closing. Stopping all runners and proxy...")
         self.stop_all_llama_runners()
         self.stop_fastapi_proxy() # Updated method call
+        self.stop_ollama_proxy() # Add method call to stop Ollama proxy
 
         # Give threads a moment to stop gracefully
         # A more robust shutdown might involve waiting for threads to finish
@@ -671,6 +662,36 @@ class MainWindow(QWidget):
         self.fastapi_proxy_thread.start()
 
 
+    def start_ollama_proxy(self):
+        """
+        Starts the Ollama proxy in a separate thread.
+        This is now called automatically in __init__.
+        """
+        if self.ollama_proxy_thread is not None and self.ollama_proxy_thread.isRunning():
+            print("Ollama Proxy is already running.")
+            return
+
+        print("Starting Ollama Proxy...")
+
+        # Pass the necessary callback methods to the proxy thread
+        self.ollama_proxy_thread = OllamaProxyThread(
+            models_config=self.models, # Pass the models configuration
+            is_model_running_callback=self.is_llama_runner_running, # Pass the callback method
+            get_runner_port_callback=self.get_runner_port, # Pass the callback method
+            request_runner_start_callback=self.request_runner_start, # Pass the callback method
+        )
+        # Connect signals from the proxy thread if needed (e.g., started, stopped, error)
+        # self.ollama_proxy_thread.started.connect(self.on_ollama_proxy_started)
+        # self.ollama_proxy_thread.stopped.connect(self.on_ollama_proxy_stopped)
+        # self.ollama_proxy_thread.error.connect(self.on_ollama_proxy_error)
+
+        # Connect MainWindow signals to proxy thread slots for bridging
+        self.runner_port_ready_for_proxy.connect(self.ollama_proxy_thread.on_runner_port_ready)
+        self.runner_stopped_for_proxy.connect(self.ollama_proxy_thread.on_runner_stopped)
+
+        self.ollama_proxy_thread.start()
+
+
     def stop_fastapi_proxy(self): # Updated method name
         """
         Stops the FastAPI proxy thread.
@@ -693,6 +714,24 @@ class MainWindow(QWidget):
         else:
             print("FastAPI Proxy is not running.") # Updated print
             # Updated status label variable name
+
+
+    def stop_ollama_proxy(self):
+        """
+        Stops the Ollama proxy thread.
+        This is now called automatically on closeEvent.
+        """
+        if self.ollama_proxy_thread and self.ollama_proxy_thread.isRunning():
+            print("Stopping Ollama Proxy...")
+
+            self.ollama_proxy_thread.stop()
+            # Don't wait() here in the UI thread
+            # The thread will eventually finish and the status will update (manually for now)
+            # A signal from the proxy thread would be better here.
+            # For now, manually update status after signaling stop
+
+        else:
+            print("Ollama Proxy is not running.")
 
 
     @Slot(str)

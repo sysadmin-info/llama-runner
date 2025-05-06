@@ -1,6 +1,5 @@
 import os
 import json
-import hashlib
 import logging
 import traceback # Import traceback
 from pathlib import Path
@@ -108,7 +107,8 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
 
     try:
         reader = GGUFReader(model_path, 'r')
-        metadata = {}
+        raw_metadata = {} # Initialize raw_metadata dictionary
+        final_metadata = {} # Initialize the dictionary to be returned
 
         # Iterate through all fields and extract key-value pairs
         for key, field in reader.fields.items():
@@ -117,7 +117,7 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                 # field.data[0] is the index into field.parts
                 # This might return a list/tuple or array-like object even for scalar types
                 value = field.parts[field.data[0]]
-                metadata[key] = value
+                raw_metadata[key] = value # Store in raw_metadata
                 # Add detailed logging for extracted values, especially non-scalar ones
                 if isinstance(value, (list, tuple)):
                      logging.debug(f"Extracted list/tuple metadata for key '{key}': Type={type(value)}, Length={len(value)}, Value={value}")
@@ -128,16 +128,16 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
 
             except (IndexError, TypeError, AttributeError) as e:
                 logging.warning(f"Could not extract value for key '{key}' from {model_path}: {e}")
-                metadata[key] = None # Store None or skip? Store None for now.
+                raw_metadata[key] = None # Store None or skip? Store None for now.
             except Exception as e:
                  # Catch any other unexpected errors during extraction
                  logging.warning(f"Unexpected error extracting value for key '{key}' from {model_path}: {e}\n{traceback.format_exc()}")
-                 metadata[key] = None
+                 raw_metadata[key] = None
 
-        # Helper to safely get a scalar value from metadata, handling lists/tuples/arrays
+        # Helper to safely get a scalar value from a metadata dictionary, handling lists/tuples/arrays
         # Returns the raw scalar value, does not force string conversion
-        def get_scalar_metadata(key: str, default: Any = None) -> Any:
-            value = metadata.get(key)
+        def get_scalar_metadata(metadata_dict: Dict[str, Any], key: str, default: Any = None) -> Any:
+            value = metadata_dict.get(key)
 
             # Handle numpy arrays/memmaps first
             if NUMPY_AVAILABLE and isinstance(value, (np.ndarray, np.memmap)):
@@ -159,12 +159,12 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                              # Attempt to convert array of numbers to string representation
                              return np.array2string(value, separator=', ', max_line_width=np.inf)
                     except Exception as e:
-                        logging.warning(f"Could not convert numpy array to string for key '{key}': {e}")
-                        return default
+                         logging.warning(f"Could not convert numpy array to string for key '{key}': {e}")
+                         return default
                 else:
-                    # Handle multi-dimensional arrays or other complex cases by returning default
-                    logging.warning(f"Unsupported numpy array shape/ndim for key '{key}': {value.shape}")
-                    return default
+                     # Handle multi-dimensional arrays or other complex cases by returning default
+                     logging.warning(f"Unsupported numpy array shape/ndim for key '{key}': {value.shape}")
+                     return default
 
             # Keep unwrapping lists/tuples until a non-container or None is found
             while isinstance(value, (list, tuple)) and len(value) > 0:
@@ -177,13 +177,12 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
                 return value
 
 
-        # --- Construct LM Studio format based on requested fields ---
+        # --- Construct LM Studio format based on requested fields, using raw_metadata ---
 
         # id: general.name (fallback to filename)
-        model_id_val = get_scalar_metadata('general.name', os.path.basename(model_path))
+        model_id_val = get_scalar_metadata(raw_metadata, 'general.name', os.path.basename(model_path))
         # Ensure ID is a string
         model_id = str(model_id_val) if model_id_val is not None else os.path.basename(model_path)
-
 
         # object: "model" (static)
         obj_type = "model" # Static value as per LM Studio API
@@ -191,7 +190,7 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         # type: "llm", "vlm", "embeddings" (detected)
         # Check metadata keys first
         model_type = "llm" # Default to llm
-        ggml_model_type_val = get_scalar_metadata("ggml.model.type")
+        ggml_model_type_val = get_scalar_metadata(raw_metadata, "ggml.model.type")
         if ggml_model_type_val is not None and isinstance(ggml_model_type_val, str) and ggml_model_type_val.lower() == "embedding":
              model_type = "embeddings"
         elif ggml_model_type_val is not None and isinstance(ggml_model_type_val, str) and ggml_model_type_val.lower() == "vlm":
@@ -204,16 +203,13 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
 
 
         # publisher: general.quantized_by (fallback to general.url, then local)
-        publisher_val = get_scalar_metadata('general.quantized_by', get_scalar_metadata('general.url', 'local'))
+        publisher_val = get_scalar_metadata(raw_metadata, 'general.quantized_by', get_scalar_metadata(raw_metadata, 'general.url', 'local'))
         # Ensure publisher is a string
         publisher = str(publisher_val) if publisher_val is not None else 'local'
 
-
-        # arch: general.architecture (fallback to unknown)
         architecture_val = get_scalar_metadata('general.architecture', 'unknown')
         # Ensure architecture is a string
         architecture = str(architecture_val) if architecture_val is not None else 'unknown'
-
 
         # compatibility_type: "gguf" (static)
         compatibility_type = "gguf" # Static value
@@ -225,7 +221,6 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         # --- Add debug logging for file_type_val ---
         logging.debug(f"Raw 'general.file_type' value: {file_type_val}, Type: {type(file_type_val)}")
         # --- End debug logging ---
-
         if GGUF_AVAILABLE and file_type_val is not None:
             try:
                 # Attempt to convert file_type_val to an integer
@@ -253,10 +248,10 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
              if "q4_k_m" in os.path.basename(model_path).lower():
                   quantization = "Q4_K_M" # Common convention
              # Fallback: Check if quantization info is directly in metadata keys (e.g., "quantization.method")
-             elif get_scalar_metadata("quantization.method"):
-                  quantization = get_scalar_metadata("quantization.method")
-             elif get_scalar_metadata("quantization_version"): # Sometimes just a version number
-                  quantization = f"Q{get_scalar_metadata('quantization_version')}"
+             elif get_scalar_metadata(raw_metadata, "quantization.method"):
+                  quantization = get_scalar_metadata(raw_metadata, "quantization.method")
+             elif get_scalar_metadata(raw_metadata, "quantization_version"): # Sometimes just a version number
+                  quantization = f"Q{get_scalar_metadata(raw_metadata, 'quantization_version')}"
 
         # --- Remove "MOSTLY_" prefix if it exists ---
         if isinstance(quantization, str) and quantization.startswith("MOSTLY_"):
@@ -273,7 +268,7 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         if architecture != 'unknown':
              # Try the architecture-specific key
              ctx_key = f'{architecture}.context_length'
-             arch_ctx_val = get_scalar_metadata(ctx_key) # Use the helper
+             arch_ctx_val = get_scalar_metadata(raw_metadata, ctx_key) # Use the helper
              if arch_ctx_val is not None:
                  try:
                      max_ctx = int(arch_ctx_val)
@@ -294,7 +289,7 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
              max_ctx = 4096
 
 
-        # Construct the final LM Studio format dictionary
+        # Construct the LM Studio format dictionary
         lmstudio_format = {
             "id": model_id,
             "object": obj_type,
@@ -307,11 +302,17 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
             "max_context_length": max_ctx
         }
 
+        # Add LM Studio format fields to final_metadata
+        final_metadata.update(lmstudio_format)
+
+        # Add raw_metadata to final_metadata
+        final_metadata["raw_metadata"] = raw_metadata
+
         logging.info(f"Successfully extracted metadata for {model_path}")
         # --- Add debug logging for the return value ---
-        logging.debug(f"Successfully extracted metadata for {model_path}: {lmstudio_format}")
+        logging.debug(f"Successfully extracted metadata for {model_path}: {final_metadata}")
         # --- End debug logging ---
-        return lmstudio_format
+        return final_metadata
 
     except Exception as e:
         # Add traceback to the main extraction error logging

@@ -1,0 +1,632 @@
+import asyncio
+import logging
+import traceback
+import json
+from typing import Dict, Any, Callable, Optional, AsyncGenerator
+
+import httpx
+
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse, StreamingResponse
+import uvicorn
+
+from PySide6.QtCore import QThread, Slot
+
+from llama_runner import gguf_metadata
+from llama_runner.ollama_proxy_conversions import (
+    embeddingRequestFromOllama, embeddingResponseToOllama,
+    generateRequestFromOllama, generateResponseToOllama,
+    chatRequestFromOllama, chatResponseToOllama
+)
+
+# --- Create our own FastAPI app instance ---
+app = FastAPI()
+# --- End create app instance ---
+
+# Define standalone handlers that access state via app.state
+
+# --- Handler for dynamic routing of requests to Llama.cpp runner ---
+async def _dynamic_route_runner_request_generator(request: Request, target_path: str, request_body: Dict[str, Any]) -> AsyncGenerator[bytes, None]:
+    """
+    Intercepts requests, ensures the target runner is running,
+    and forwards the request to the runner's port, yielding the response chunks.
+    This is an async generator function for streaming responses.
+    """
+    # Access state and callbacks from the request's app instance
+    models_config = request.app.state.models_config
+    get_runner_port_callback = request.app.state.get_runner_port_callback
+    request_runner_start_callback = request.app.state.request_runner_start_callback
+    # Access the proxy thread instance to get the futures dictionary
+    proxy_thread: OllamaProxyThread = request.app.state.proxy_thread_instance
+
+    model_name = request_body.get("model")
+    if not model_name:
+        logging.warning(f"Model name not found in request body for {request.url.path}")
+        yield b'data: {"error": "Model name not specified in request body."}\n\n'
+        return # Stop the generator
+
+    logging.debug(f"Intercepted request for model: {model_name} at path: {request.url.path}")
+    logging.debug(f"Available models in models_config: {list(models_config.keys())}")
+
+    # Check if the model exists in the configuration
+    if model_name not in models_config:
+        logging.warning(f"Request for unknown model: {model_name}")
+        yield f"data: {{\"error\": \"Model '{model_name}' not found in configuration.\"}}\n\n".encode('utf-8')
+        return # Stop the generator
+
+    # Check if the runner is already running
+    port = get_runner_port_callback(model_name)
+
+    if port is None:
+        # Runner is not running, request startup and wait
+        logging.info(f"Runner for {model_name} not running. Requesting startup.")
+        try:
+            # Request startup via the callback, which returns an asyncio.Future
+            # Store the future locally in the proxy thread instance
+            if model_name not in proxy_thread._runner_ready_futures or proxy_thread._runner_ready_futures[model_name].done():
+                 logging.debug(f"Creating new startup future for {model_name}")
+                 proxy_thread._runner_ready_futures[model_name] = request_runner_start_callback(model_name)
+            else:
+                 logging.debug(f"Using existing startup future for {model_name}")
+
+            # Wait for the runner to become ready (Future to resolve)
+            # Use a timeout to prevent infinite waiting
+            startup_timeout = 60 # seconds
+            port = await asyncio.wait_for(
+                proxy_thread._runner_ready_futures[model_name],
+                timeout=startup_timeout
+            )
+            logging.info(f"Runner for {model_name} is ready on port {port} after startup.")
+
+        except asyncio.TimeoutError:
+            logging.error(f"Timeout waiting for runner {model_name} to start after {startup_timeout} seconds.")
+            # Clean up the future if it timed out
+            if model_name in proxy_thread._runner_ready_futures and not proxy_thread._runner_ready_futures[model_name].done():
+                 proxy_thread._runner_ready_futures[model_name].cancel() # Cancel the future
+                 del proxy_thread._runner_ready_futures[model_name]
+            yield f"data: {{\"error\": \"Timeout starting runner for model '{model_name}'.\"}}\n\n".encode('utf-8')
+            return # Stop the generator
+        except Exception as e:
+            logging.error(f"Error during runner startup for {model_name}: {e}\n{traceback.format_exc()}")
+            # Clean up the future if it failed
+            if model_name in proxy_thread._runner_ready_futures and not proxy_thread._runner_ready_futures[model_name].done():
+                 proxy_thread._runner_ready_futures[model_name].set_exception(e) # Set exception on the future
+                 del proxy_thread._runner_ready_futures[model_name]
+            yield f"data: {{\"error\": \"Error starting runner for model '{model_name}': {e}\"}}\n\n".encode('utf-8')
+            return # Stop the generator
+
+    else:
+        logging.debug(f"Runner for {model_name} is already running on port {port}.")
+        # If it was running, ensure its future is marked as done with the port
+        # This handles cases where the proxy restarts but the runner is still alive
+        if model_name not in proxy_thread._runner_ready_futures or not proxy_thread._runner_ready_futures[model_name].done():
+             logging.debug(f"Creating completed future for already running runner {model_name}")
+             future = asyncio.Future()
+             future.set_result(port)
+             proxy_thread._runner_ready_futures[model_name] = future
+             # No need for timer cleanup here, as it's already running.
+             # The future will be removed if the runner stops later.
+
+
+    # Runner is ready and port is known. Forward the request.
+    target_url = f"http://127.0.0.1:{port}{target_path}"
+    logging.debug(f"Target URL: {target_url}")
+    logging.debug(f"Forwarding request for {model_name} to {target_url}")
+
+    # Use httpx to forward the request and yield chunks directly
+    async with httpx.AsyncClient() as client:
+        try:
+            # Reconstruct headers, removing host and potentially others that shouldn't be forwarded
+            headers = dict(request.headers)
+            headers.pop('host', None) # Remove host header
+            # Remove content-length header as httpx will set it correctly based on the forwarded content
+            headers.pop('content-length', None)
+            # Forward the request, including method, URL path, headers, and body
+            # Use the original request method and the converted request body
+            async with client.stream(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                json=request_body, # Pass the converted JSON body
+                timeout=600.0, # Use a generous timeout for model responses
+            ) as proxy_response:
+
+                # Check if the response is streaming (e.g., Server-Sent Events)
+                content_type = proxy_response.headers.get('content-type', '').lower()
+                if 'text/event-stream' in content_type:
+                     logging.debug(f"Forwarding streaming response from {target_url}")
+                     # Yield chunks directly from the httpx stream within this generator
+                     async for chunk in proxy_response.aiter_bytes():
+                        yield chunk # Yield each chunk as it arrives
+                else:
+                     logging.debug(f"Forwarding non-streaming response from {target_url}")
+                     # For non-streaming responses, read the body and yield it as a single chunk
+                     response_body = await proxy_response.aread() # Read the entire body asynchronously
+                     yield response_body # Yield the entire body as one chunk
+
+
+        except httpx.RequestError as e:
+            logging.error(f"Error forwarding request to runner {model_name} on port {port}: {e}\n{traceback.format_exc()}")
+            yield f'data: {{"error": "Error communicating with runner for model \'{model_name}\': {e}"}}\n\n'.encode('utf-8')
+
+        except Exception as e:
+            logging.error(f"Unexpected error during request forwarding for {model_name}: {e}\n{traceback.format_exc()}")
+            yield f'data: {{"error": "Internal error processing request for model \'{model_name}\': {e}"}}\n\n'.encode('utf-8')
+
+# --- End handler for dynamic routing ---
+
+
+# --- Handlers for Ollama API endpoints ---
+
+@app.post("/api/generate")
+async def generate_completion(request: Request):
+    """Handles Ollama /api/generate requests."""
+    try:
+        ollama_req = await request.json()
+        openai_req = generateRequestFromOllama(ollama_req)
+
+        # Use the dynamic router to forward the converted request to the runner
+        # The target path for completions in OpenAI format is typically /v1/completions
+        async def generate_response_stream():
+            async for chunk in _dynamic_route_runner_request_generator(request, target_path="/v1/completions", request_body=openai_req):
+                # Process each chunk from the runner (OpenAI format) and convert to Ollama format
+                try:
+                    # Assuming the runner sends SSE data for streaming completions
+                    # Need to parse SSE and convert each data payload
+                    # This is a simplified example; robust SSE parsing might be needed
+                    chunk_str = chunk.decode('utf-8')
+                    # Split by SSE data blocks (data: {json}\n\n)
+                    for block in chunk_str.strip().split('\n\n'):
+                        if block.startswith('data: '):
+                            json_payload = block[len('data: '):]
+                            try:
+                                openai_resp = json.loads(json_payload)
+                                ollama_resp = generateResponseToOllama(openai_resp)
+                                # Yield the converted Ollama response as an SSE data block
+                                yield f"data: {json.dumps(ollama_resp)}\n\n".encode('utf-8')
+                            except json.JSONDecodeError:
+                                logging.warning(f"Could not decode JSON from runner response chunk: {json_payload}")
+                                # Yield an error or skip
+                                yield f'data: {{"error": "Invalid JSON from runner: {json_payload}"}}\n\n'.encode('utf-8')
+                            except Exception as conv_e:
+                                logging.error(f"Error converting OpenAI response to Ollama format: {conv_e}\n{traceback.format_exc()}")
+                                yield f'data: {{"error": "Error converting response: {conv_e}"}}\n\n'.encode('utf-8')
+                        else:
+                             # Handle non-data lines if necessary (e.g., comments, event lines)
+                             pass # Or yield them directly if needed
+
+                except Exception as e:
+                    logging.error(f"Error processing runner response chunk: {e}\n{traceback.format_exc()}")
+                    yield f'data: {{"error": "Error processing response chunk: {e}"}}\n\n'.encode('utf-8')
+
+        # Return StreamingResponse with the generator
+        return StreamingResponse(content=generate_response_stream(), media_type="text/event-stream")
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON request body")
+    except Exception as e:
+        logging.error(f"Error handling /api/generate: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal Server Error processing generate request")
+
+
+@app.post("/api/chat")
+async def chat_completion(request: Request):
+    """Handles Ollama /api/chat requests."""
+    try:
+        ollama_req = await request.json()
+        openai_req = chatRequestFromOllama(ollama_req)
+
+        # Use the dynamic router to forward the converted request to the runner
+        # The target path for chat completions in OpenAI format is typically /v1/chat/completions
+        async def chat_response_stream():
+            async for chunk in _dynamic_route_runner_request_generator(request, target_path="/v1/chat/completions", request_body=openai_req):
+                 # Process each chunk from the runner (OpenAI format) and convert to Ollama format
+                 try:
+                     # Assuming the runner sends SSE data for streaming chat completions
+                     chunk_str = chunk.decode('utf-8')
+                     for block in chunk_str.strip().split('\n\n'):
+                         if block.startswith('data: '):
+                             json_payload = block[len('data: '):]
+                             try:
+                                 openai_resp = json.loads(json_payload)
+                                 ollama_resp = chatResponseToOllama(openai_resp)
+                                 yield f"data: {json.dumps(ollama_resp)}\n\n".encode('utf-8')
+                             except json.JSONDecodeError:
+                                 logging.warning(f"Could not decode JSON from runner response chunk: {json_payload}")
+                                 yield f'data: {{"error": "Invalid JSON from runner: {json_payload}"}}\n\n'.encode('utf-8')
+                             except Exception as conv_e:
+                                 logging.error(f"Error converting OpenAI response to Ollama format: {conv_e}\n{traceback.format_exc()}")
+                                 yield f'data: {{"error": "Error converting response: {conv_e}"}}\n\n'.encode('utf-8')
+                         else:
+                              pass
+
+                 except Exception as e:
+                     logging.error(f"Error processing runner response chunk: {e}\n{traceback.format_exc()}")
+                     yield f'data: {{"error": "Error processing response chunk: {e}"}}\n\n'.encode('utf-8')
+
+
+        # Return StreamingResponse with the generator
+        return StreamingResponse(content=chat_response_stream(), media_type="text/event-stream")
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON request body")
+    except Exception as e:
+        logging.error(f"Error handling /api/chat: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal Server Error processing chat request")
+
+
+@app.post("/api/embeddings")
+async def generate_embeddings(request: Request):
+    """Handles Ollama /api/embeddings requests."""
+    try:
+        ollama_req = await request.json()
+        openai_req = embeddingRequestFromOllama(ollama_req)
+
+        # Use the dynamic router to forward the converted request to the runner
+        # The target path for embeddings in OpenAI format is typically /v1/embeddings
+        # Embeddings are typically non-streaming
+        async for chunk in _dynamic_route_runner_request_generator(request, target_path="/v1/embeddings", request_body=openai_req):
+            # For non-streaming, the generator yields the entire body as one chunk
+            try:
+                openai_resp = json.loads(chunk.decode('utf-8'))
+                ollama_resp = embeddingResponseToOllama(openai_resp)
+                return JSONResponse(content=ollama_resp)
+            except json.JSONDecodeError:
+                logging.warning(f"Could not decode JSON from runner response: {chunk.decode('utf-8')}")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid JSON response from runner")
+            except Exception as conv_e:
+                logging.error(f"Error converting OpenAI response to Ollama format: {conv_e}\n{traceback.format_exc()}")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error converting response")
+
+        # If the generator finishes without yielding, it means an error occurred in the router
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error routing request to runner")
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON request body")
+    except Exception as e:
+        logging.error(f"Error handling /api/embeddings: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal Server Error processing embeddings request")
+
+
+@app.get("/api/tags")
+async def list_models(request: Request):
+    """Handles Ollama /api/tags requests."""
+    try:
+        models_config = request.app.state.models_config
+        model_list = []
+        for name, config in models_config.items():
+            # Construct the model dictionary based on the expected format
+            # Assuming config contains 'modified_at', 'size', 'digest', and 'details'
+            model_entry = {
+                "name": name,
+                "modified_at": config.get("modified_at", ""), # Provide default empty string if key is missing
+                "size": config.get("size", 0), # Provide default 0 if key is missing
+                "digest": config.get("digest", ""), # Provide default empty string if key is missing
+                "details": config.get("details", {}) # Provide default empty dict if key is missing
+            }
+            model_list.append(model_entry)
+
+        return JSONResponse(content={"models": model_list})
+
+    except Exception as e:
+        logging.error(f"Error handling /api/tags: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal Server Error processing list models request")
+
+
+
+# --- End handlers for Ollama API endpoints ---
+
+@app.post("/api/show")
+async def show_model_info(request: Request):
+    """Handles Ollama /api/show requests."""
+    try:
+        request_body = await request.json()
+        model_name = request_body.get("model")
+
+        if not model_name:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Model name not specified in request body")
+
+        models_config = request.app.state.models_config
+
+        if model_name not in models_config:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model '{model_name}' not found")
+
+        model_config = models_config[model_name]
+        model_path = model_config.get("path")
+
+        if not model_path:
+             # This shouldn't happen if models_config is correctly populated, but handle defensively
+             logging.error(f"Model config for {model_name} is missing 'path'. Config: {model_config}")
+             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Configuration error for model '{model_name}'")
+
+        # Access or load GGUF metadata
+        try:
+            # Assuming gguf_metadata.get_metadata handles caching internally
+            metadata = gguf_metadata.get_metadata(model_path)
+            chat_template = metadata.get("chat_template", "")
+            model_info = metadata
+        except Exception as e:
+            logging.error(f"Error accessing GGUF metadata for {model_name} at {model_path}: {e}\n{traceback.format_exc()}")
+            # Decide whether to raise an error or return partial info.
+            # For now, raise an error as metadata is a required part of the response.
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error accessing metadata for model '{model_name}'")
+
+        # Construct the 'details' object
+        details = {
+            "parent_model": model_config.get("parent_model", ""),
+            "format": model_config.get("format", ""),
+            "family": model_config.get("details", {}).get("architecture", ""), # Map architecture to family
+            "families": model_config.get("families", []),
+            "parameter_size": model_config.get("parameter_size", ""),
+            "quantization_level": model_config.get("quantization_level", ""),
+        }
+
+        # Construct the final response
+        response_content = {
+            "modelfile": "",
+            "parameters": "",
+            "template": chat_template,
+            "details": details,
+            "model_info": model_info,
+            "capabilities": ["completion", "vision"], # Hardcoded capabilities
+        }
+
+        return JSONResponse(content=response_content)
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON request body")
+    except HTTPException as http_exc:
+        # Re-raise explicit HTTPExceptions
+        raise http_exc
+    except Exception as e:
+        logging.error(f"Error handling /api/show: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal Server Error processing show request")
+
+# --- End handlers for Ollama API endpoints ---
+
+# --- Handlers for OpenAI compatible API endpoints (v1) ---
+
+@app.get("/v1/models")
+async def list_openai_models(request: Request):
+    """Handles OpenAI /v1/models requests."""
+    try:
+        models_config = request.app.state.models_config
+        model_list = []
+        # Placeholder values for fields not available in models_config
+        created_placeholder = 1678880000 # Example timestamp
+        owned_by_placeholder = "llama-runner"
+
+        for name, config in models_config.items():
+            # Construct the model dictionary based on the expected OpenAI format
+            model_entry = {
+                "id": name,
+                "object": "model",
+                "created": created_placeholder,
+                "owned_by": owned_by_placeholder,
+                # Add other relevant fields if available in models_config and needed
+                # "size": config.get("size", 0),
+                # "details": config.get("details", {})
+            }
+            model_list.append(model_entry)
+
+        return JSONResponse(content={"object": "list", "data": model_list})
+
+    except Exception as e:
+        logging.error(f"Error handling /v1/models: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal Server Error processing list models request")
+
+# --- End handlers for OpenAI compatible API endpoints (v1) ---
+
+@app.post("/v1/completions")
+async def openai_completions(request: Request):
+    """Handles OpenAI /v1/completions requests."""
+    try:
+        request_body = await request.json()
+        # No conversion needed here, assuming the incoming request is already OpenAI format
+        # If conversion from a different format (e.g., Ollama) was needed, it would happen here.
+        # For this task, we assume the runner expects OpenAI format directly on /v1 paths.
+
+        async def completion_response_stream():
+            # The dynamic router handles the forwarding and streaming
+            async for chunk in _dynamic_route_runner_request_generator(request, target_path="/v1/completions", request_body=request_body):
+                yield chunk # Yield chunks directly from the runner
+
+        # Return StreamingResponse with the generator
+        return StreamingResponse(content=completion_response_stream(), media_type="text/event-stream")
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON request body")
+    except Exception as e:
+        logging.error(f"Error handling /v1/completions: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal Server Error processing completions request")
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: Request):
+    """Handles OpenAI /v1/chat/completions requests."""
+    try:
+        request_body = await request.json()
+        # No conversion needed here, assuming the incoming request is already OpenAI format
+
+        async def chat_completion_response_stream():
+            # The dynamic router handles the forwarding and streaming
+            async for chunk in _dynamic_route_runner_request_generator(request, target_path="/v1/chat/completions", request_body=request_body):
+                yield chunk # Yield chunks directly from the runner
+
+        # Return StreamingResponse with the generator
+        return StreamingResponse(content=chat_completion_response_stream(), media_type="text/event-stream")
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON request body")
+    except Exception as e:
+        logging.error(f"Error handling /v1/chat/completions: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal Server Error processing chat completions request")
+
+@app.post("/v1/embeddings")
+async def openai_embeddings(request: Request):
+    """Handles OpenAI /v1/embeddings requests."""
+    try:
+        request_body = await request.json()
+        # No conversion needed here, assuming the incoming request is already OpenAI format
+
+        # Embeddings are typically non-streaming
+        async for chunk in _dynamic_route_runner_request_generator(request, target_path="/v1/embeddings", request_body=request_body):
+            # For non-streaming, the generator yields the entire body as one chunk
+            try:
+                # Assuming the runner returns JSON directly for non-streaming
+                response_content = json.loads(chunk.decode('utf-8'))
+                return JSONResponse(content=response_content)
+            except json.JSONDecodeError:
+                logging.warning(f"Could not decode JSON from runner response for embeddings: {chunk.decode('utf-8')}")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid JSON response from runner for embeddings")
+            except Exception as e:
+                logging.error(f"Error processing runner response for embeddings: {e}\n{traceback.format_exc()}")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error processing embeddings response")
+
+        # If the generator finishes without yielding, it means an error occurred in the router
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error routing request to runner for embeddings")
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON request body")
+    except Exception as e:
+        logging.error(f"Error handling /v1/embeddings: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal Server Error processing embeddings request")
+
+
+class OllamaProxyThread(QThread):
+    """
+    QThread to run the FastAPI proxy emulating the Ollama API in a separate thread.
+    """
+    # Define signals if needed (e.g., started, stopped, error)
+    # started = Signal()
+    # stopped = Signal()
+    # error = Signal(str)
+
+    def __init__(self,
+                 models_config: Dict[str, Dict[str, Any]],
+                 is_model_running_callback: Callable[[str], bool],
+                 get_runner_port_callback: Callable[[str], Optional[int]],
+                 request_runner_start_callback: Callable[[str], asyncio.Future]):
+        super().__init__()
+        self.models_config = models_config
+        self.is_model_running_callback = is_model_running_callback
+        self.get_runner_port_callback = get_runner_port_callback
+        self.request_runner_start_callback = request_runner_start_callback
+        self.is_running = False
+        self._uvicorn_server = None
+
+        # Dictionary to hold asyncio Futures for runners that are starting
+        self._runner_ready_futures: Dict[str, asyncio.Future] = {}
+
+        # Connect to signals from MainWindow (MainWindow connects these signals to our slots)
+        # Signals: runner_port_ready_for_proxy, runner_stopped_for_proxy
+        # Slots: on_runner_port_ready, on_runner_stopped
+
+
+    @Slot(str, int)
+    def on_runner_port_ready(self, model_name: str, port: int):
+        """Slot to handle runner_port_ready_for_proxy signal from MainWindow."""
+        logging.debug(f"Ollama Proxy thread received runner_port_ready for {model_name} on port {port}")
+        # When a runner is ready, resolve its corresponding Future in our local dictionary
+        if model_name in self._runner_ready_futures and not self._runner_ready_futures[model_name].done():
+            logging.debug(f"Resolving local runner_ready_future for {model_name} with port {port}")
+            self._runner_ready_futures[model_name].set_result(port)
+        elif model_name in self._runner_ready_futures and self._runner_ready_futures[model_name].done():
+             logging.warning(f"Received runner_port_ready for {model_name}, but local Future was already done.")
+        else:
+             logging.warning(f"Received runner_port_ready for {model_name}, but no pending local Future found.")
+
+
+    @Slot(str)
+    def on_runner_stopped(self, model_name: str):
+        """Slot to handle runner_stopped_for_proxy signal from MainWindow."""
+        logging.debug(f"Ollama Proxy thread received runner_stopped for {model_name}")
+        # If a runner stops, cancel or set exception on its Future in our local dictionary
+        if model_name in self._runner_ready_futures:
+             if not self._runner_ready_futures[model_name].done():
+                 logging.debug(f"Setting exception on local runner_ready_future for {model_name} due to stop.")
+                 self._runner_ready_futures[model_name].set_exception(RuntimeError(f"Runner for {model_name} stopped unexpectedly."))
+             # Remove the future from the local dictionary
+             del self._runner_ready_futures[model_name]
+             logging.debug(f"Cleaned up local runner_ready_future for {model_name}")
+        else:
+             logging.debug(f"Received runner_stopped for {model_name}, but no local Future found.")
+
+
+    def run(self):
+        """
+        Runs the FastAPI proxy in the thread using Uvicorn.
+        """
+        self.is_running = True
+        try:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+
+            # --- Set the proxy thread instance on the app state ---
+            # This allows the standalone handlers to access the thread's local state (like _runner_ready_futures)
+            app.state.proxy_thread_instance = self
+            # --- End set instance ---
+
+            self.loop.run_until_complete(self.run_async())
+        except Exception as e:
+            logging.error(f"Unexpected error in OllamaProxyThread run: {e}\n{traceback.format_exc()}")
+        finally:
+            self.is_running = False
+
+            # --- Clean up the proxy thread instance from app state ---
+            if hasattr(app.state, 'proxy_thread_instance'):
+                 del app.state.proxy_thread_instance
+            # --- End cleanup ---
+
+            if hasattr(self, 'loop') and self.loop.is_running():
+                 self.loop.stop()
+            if hasattr(self, 'loop') and not self.loop.is_closed():
+                 self.loop.close()
+
+
+    async def run_async(self):
+        """
+        Asynchronous part of the proxy runner.
+        Starts the Uvicorn server for the FastAPI app.
+        """
+        print("Starting Ollama Proxy...")
+        try:
+            # Set state on the global app instance BEFORE creating the server
+            # This state will be accessible by the standalone handler functions
+            app.state.models_config = self.models_config
+            app.state.is_model_running_callback = self.is_model_running_callback
+            app.state.get_runner_port_callback = self.get_runner_port_callback
+            app.state.request_runner_start_callback = self.request_runner_start_callback
+
+            # Use port 11434 as required for Ollama emulation
+            uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=11434, reload=False)
+            self._uvicorn_server = uvicorn.Server(uvicorn_config)
+
+            print("Ollama Proxy listening on http://0.0.0.0:11434")
+            logging.info("Ollama Proxy listening on http://0.0.0.0:11434")
+
+            # This call is blocking until the server stops
+            await self._uvicorn_server.serve()
+
+        except Exception as e:
+            print(f"Error starting Ollama Proxy: {e}")
+            logging.error(f"Error starting Ollama Proxy: {e}\n{traceback.format_exc()}")
+            # Emit error signal if needed
+            # self.error.emit(str(e))
+        finally:
+            # Cleanup happens in run()'s finally block now
+            print("Ollama Proxy stopped.")
+            logging.info("Ollama Proxy stopped.")
+
+
+    def stop(self):
+        """
+        Signals the FastAPI proxy thread to stop.
+        """
+        self.is_running = False
+        if self._uvicorn_server:
+            self._uvicorn_server.should_exit = True
+            # Note: Stopping uvicorn gracefully can be tricky in an embedded context.
+            # This might not immediately stop the serve() call.
+            # A more robust stop might involve sending a signal or using a shutdown event.
+            # For now, setting should_exit is the standard uvicorn way.
+
