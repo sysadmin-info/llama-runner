@@ -1,22 +1,20 @@
-import sys
 import asyncio
-import subprocess
-import os
-import tempfile # Keep tempfile for potential future use, but config file logic removed
-import yaml # Keep yaml for potential future use, but config file logic removed
+
 import logging
 import traceback
-import time
 import json
-from typing import Dict, Any, Callable, List, Optional
+from typing import Dict, Any, Callable, Optional
 
 # Removed: from litellm.proxy.proxy_server import app
-from fastapi import FastAPI, HTTPException, Request, Response, status # Import FastAPI and necessary components
-from fastapi.responses import JSONResponse, StreamingResponse # RedirectResponse is not needed if we proxy
-import httpx # Import httpx for forwarding requests
+# Standard library imports
+import httpx
+
+# Third-party imports
+from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
-from PySide6.QtCore import QThread, QObject, Signal, Slot, QTimer # Import QTimer for potential use
+from PySide6.QtCore import QThread, Slot # Import QTimer for potential use
 
 from llama_runner import gguf_metadata # Import the new metadata module
 
@@ -78,10 +76,11 @@ async def _get_lmstudio_model_handler(model_id: str, request: Request):
 
 
 # --- Handler for dynamic routing of /v1/* requests ---
-async def _dynamic_route_v1_request(request: Request):
+async def _dynamic_route_v1_request_generator(request: Request, target_path: Optional[str] = None):
     """
     Intercepts /v1/* requests, ensures the target runner is running,
-    and forwards the request to the runner's port.
+    and forwards the request to the runner's port, yielding the response chunks.
+    This is an async generator function for streaming responses.
     """
     # Access state and callbacks from the request's app instance
     models_config = request.app.state.models_config
@@ -105,30 +104,38 @@ async def _dynamic_route_v1_request(request: Request):
                 body = json.loads(body_bytes)
         except json.JSONDecodeError:
             logging.warning(f"Could not decode request body as JSON for {request.url.path}")
-            # Continue without body if JSON parsing fails, maybe model is in path or headers?
-            # For now, assume model is required in body for these endpoints.
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON request body.")
+            # For a generator, we need to yield an error message or handle it differently.
+            # Raising HTTPException here won't be caught by the standard handler for generators.
+            # Yielding an error message in SSE format is a common pattern.
+            yield b'data: {"error": "Invalid JSON request body."}\n\n'
+            return # Stop the generator
 
 
         model_name = body.get("model")
         if not model_name:
              # If model is not in body, try path parameters if applicable (less common for v1)
-             # Or raise an error if model is required but missing
+             # Or yield an error if model is required but missing
              logging.warning(f"Model name not found in request body for {request.url.path}")
-             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Model name not specified in request body.")
+             yield b'data: {"error": "Model name not specified in request body."}\n\n'
+             return # Stop the generator
 
-    except HTTPException:
-         # Re-raise HTTPException if already set
-         raise
     except Exception as e:
         logging.error(f"Error reading request body or extracting model name: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid request: {e}")
+        yield f'data: {{"error": "Invalid request: {e}"}}\n\n'.encode('utf-8')
+        return # Stop the generator
+
 
     logging.debug(f"Intercepted request for model: {model_name} at path: {request.url.path}")
+    logging.debug(f"Available models in models_config: {list(models_config.keys())}")
+    logging.debug(f"Available models in app.state.models_metadata: {[model['id'] for model in app.state.models_metadata]}")
 
-    if model_name not in models_config:
+    id_to_name_mapping = {v: k for k, v in gguf_metadata.get_model_name_to_id_mapping(models_config).items()}
+    model_name_in_config = id_to_name_mapping.get(model_name, model_name)
+    if model_name_in_config not in models_config:
         logging.warning(f"Request for unknown model: {model_name}")
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model '{model_name}' not found in configuration.")
+        yield f"data: {{\"error\": \"Model '{model_name}' not found in configuration.\"}}\n\n".encode('utf-8')
+        return # Stop the generator
+    model_name = model_name_in_config
 
     # Check if the runner is already running
     port = get_runner_port_callback(model_name)
@@ -160,14 +167,16 @@ async def _dynamic_route_v1_request(request: Request):
             if model_name in proxy_thread._runner_ready_futures and not proxy_thread._runner_ready_futures[model_name].done():
                  proxy_thread._runner_ready_futures[model_name].cancel() # Cancel the future
                  del proxy_thread._runner_ready_futures[model_name]
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Timeout starting runner for model '{model_name}'.")
+            yield f"data: {{\"error\": \"Timeout starting runner for model '{model_name}'.\"}}\n\n".encode('utf-8')
+            return # Stop the generator
         except Exception as e:
             logging.error(f"Error during runner startup for {model_name}: {e}\n{traceback.format_exc()}")
             # Clean up the future if it failed
             if model_name in proxy_thread._runner_ready_futures and not proxy_thread._runner_ready_futures[model_name].done():
                  proxy_thread._runner_ready_futures[model_name].set_exception(e) # Set exception on the future
                  del proxy_thread._runner_ready_futures[model_name]
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error starting runner for model '{model_name}': {e}")
+            yield f"data: {{\"error\": \"Error starting runner for model '{model_name}': {e}\"}}\n\n".encode('utf-8')
+            return # Stop the generator
 
     else:
         logging.debug(f"Runner for {model_name} is already running on port {port}.")
@@ -183,11 +192,13 @@ async def _dynamic_route_v1_request(request: Request):
 
 
     # Runner is ready and port is known. Forward the request.
-    # Construct the target URL using the known port and the original request path
-    target_url = f"http://127.0.0.1:{port}{request.url.path}"
+    # Construct the target URL using the known port and the provided target_path or original request path
+    path_to_use = target_path if target_path is not None else request.url.path
+    target_url = f"http://127.0.0.1:{port}{path_to_use}"
+    logging.debug(f"Target URL: {target_url}")
     logging.debug(f"Forwarding request for {model_name} to {target_url}")
 
-    # Use httpx to forward the request
+    # Use httpx to forward the request and yield chunks directly
     async with httpx.AsyncClient() as client:
         try:
             # Reconstruct headers, removing host and potentially others that shouldn't be forwarded
@@ -195,104 +206,72 @@ async def _dynamic_route_v1_request(request: Request):
             headers.pop('host', None) # Remove host header
             # Remove content-length header as httpx will set it correctly based on the forwarded content
             headers.pop('content-length', None)
-
-
             # Forward the request, including method, URL path, headers, and body
             # Use the body_bytes read earlier
-            proxy_response = await client.request(
+            async with client.stream(
                 method=request.method,
                 url=target_url,
                 headers=headers,
                 content=body_bytes, # Pass the raw body bytes
                 timeout=600.0, # Use a generous timeout for model responses
-                # stream=True # Enable streaming response handling - httpx handles this automatically with async iteration
-            )
+            ) as proxy_response:
 
-            # Check if the response is streaming (e.g., Server-Sent Events)
-            # This requires inspecting headers like 'content-type'
-            content_type = proxy_response.headers.get('content-type', '').lower()
-            if 'text/event-stream' in content_type:
-                 logging.debug(f"Forwarding streaming response from {target_url}")
-                 # Return a StreamingResponse that reads from the httpx response stream
-                 return StreamingResponse(
-                     content=proxy_response.aiter_bytes(), # Use aiter_bytes for async iteration
-                     status_code=proxy_response.status_code,
-                     headers=proxy_response.headers
-                 )
-            else:
-                 logging.debug(f"Forwarding non-streaming response from {target_url}")
-                 # For non-streaming responses, read the body and return a standard Response
-                 response_body = await proxy_response.aread() # Read the entire body asynchronously
-                 return Response(
-                     content=response_body,
-                     status_code=proxy_response.status_code,
-                     headers=proxy_response.headers
-                 )
+                # Check if the response is streaming (e.g., Server-Sent Events)
+                # This requires inspecting headers like 'content-type'
+                content_type = proxy_response.headers.get('content-type', '').lower()
+                if 'text/event-stream' in content_type:
+                     logging.debug(f"Forwarding streaming response from {target_url}")
+                     # Yield chunks directly from the httpx stream within this generator
+                     async for chunk in proxy_response.aiter_bytes():
+                        yield chunk # Yield each chunk as it arrives
+                else:
+                     logging.debug(f"Forwarding non-streaming response from {target_url}")
+                     # For non-streaming responses, read the body and yield it as a single chunk
+                     response_body = await proxy_response.aread() # Read the entire body asynchronously
+                     yield response_body # Yield the entire body as one chunk
 
 
         except httpx.RequestError as e:
             logging.error(f"Error forwarding request to runner {model_name} on port {port}: {e}\n{traceback.format_exc()}")
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Error communicating with runner for model '{model_name}': {e}")
+            # In a generator, we can't raise HTTPException directly.
+            # We could yield an error message or re-raise after the generator is consumed.
+            # Yielding an error message in SSE format is a common pattern.
+            yield f'data: {{"error": "Error communicating with runner for model \'{model_name}\': {e}"}}\n\n'.encode('utf-8')
+            # No return here, let the generator finish naturally
+
+
         except Exception as e:
             logging.error(f"Unexpected error during request forwarding for {model_name}: {e}\n{traceback.format_exc()}")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal error processing request for model '{model_name}': {e}")
+            # Handle unexpected errors similarly
+            yield f'data: {{"error": "Internal error processing request for model \'{model_name}\': {e}"}}\n\n'.encode('utf-8')
+            # No return here, let the generator finish naturally
+
 
 # --- End handler for /v1/* requests ---
 
 
 # --- Handlers for /api/v0/* proxying ---
-# These handlers will call the _dynamic_route_v1_request handler internally
+# These handlers will call the _dynamic_route_v1_request_generator handler internally
 @app.post("/api/v0/chat/completions")
 async def _proxy_v0_chat_completions(request: Request):
     """Proxies /api/v0/chat/completions to /v1/chat/completions."""
     logging.debug("Proxying /api/v0/chat/completions to /v1/chat/completions")
-    # Modify the request URL path to /v1/chat/completions before passing to the dynamic router
-    # Create a new Request object with the modified URL path
-    # Note: Creating a new Request object and copying state is complex.
-    # A simpler approach is to modify the path on the original request object if possible,
-    # or pass the target path explicitly to the dynamic router.
-    # Let's modify the request.url.path temporarily for the call. This might have side effects.
-    # A cleaner way is to pass the target path to _dynamic_route_v1_request.
-    # Let's refactor _dynamic_route_v1_request to accept a target_path.
-
-    # --- Refactoring _dynamic_route_v1_request to accept target_path ---
-    # This requires changing the signature of _dynamic_route_v1_request
-    # and updating where it's called.
-
-    # Let's stick to the simpler approach for now: modify the request path temporarily.
-    # This is less ideal but avoids a larger refactor.
-    original_path = request.url.path
-    request.scope['path'] = "/v1/chat/completions"
-    try:
-        response = await _dynamic_route_v1_request(request)
-        return response
-    finally:
-        # Restore the original path
-        request.scope['path'] = original_path
-
-@app.post("/api/v0/completions")
-async def _proxy_v0_completions(request: Request):
-    """Proxies /api/v0/completions to /v1/completions."""
-    logging.debug("Proxying /api/v0/completions to /v1/completions")
-    original_path = request.url.path
-    request.scope['path'] = "/v1/completions"
-    try:
-        response = await _dynamic_route_v1_request(request)
-        return response
-    finally:
-        request.scope['path'] = original_path
+    # Return StreamingResponse with the generator
+    return StreamingResponse(content=_dynamic_route_v1_request_generator(request, target_path="/v1/chat/completions"))
 
 @app.post("/api/v0/embeddings")
 async def _proxy_v0_embeddings(request: Request):
     """Proxies /api/v0/embeddings to /v1/embeddings."""
     logging.debug("Proxying /api/v0/embeddings to /v1/embeddings")
-    original_path = request.url.path
-    request.scope['path'] = "/v1/embeddings"
-    try:
-        response = await _dynamic_route_v1_request(request)
-        return response
-    finally:
-        request.scope['path'] = original_path
+    # Return StreamingResponse with the generator
+    return StreamingResponse(content=_dynamic_route_v1_request_generator(request, target_path="/v1/embeddings"))
+
+@app.post("/api/v0/completions")
+async def _proxy_v0_completions(request: Request):
+    """Proxies /api/v0/completions to /v1/completions."""
+    logging.debug("Proxying /api/v0/completions to /v1/completions")
+    # Return StreamingResponse with the generator
+    return StreamingResponse(content=_dynamic_route_v1_request_generator(request, target_path="/v1/completions"))
 
 # --- End handlers for /api/v0/* proxying ---
 
@@ -329,15 +308,18 @@ current_v1_handlers = {route.path: route.endpoint for route in app.routes if rou
 # Add routes using the @app.post decorator
 @app.post("/v1/chat/completions")
 async def _v1_chat_completions_handler(request: Request):
-    return await _dynamic_route_v1_request(request)
+    # Return StreamingResponse with the generator
+    return StreamingResponse(content=_dynamic_route_v1_request_generator(request))
 
 @app.post("/v1/completions")
 async def _v1_completions_handler(request: Request):
-    return await _dynamic_route_v1_request(request)
+    # Return StreamingResponse with the generator
+    return StreamingResponse(content=_dynamic_route_v1_request_generator(request))
 
 @app.post("/v1/embeddings")
 async def _v1_embeddings_handler(request: Request):
-    return await _dynamic_route_v1_request(request)
+    # Return StreamingResponse with the generator
+    return StreamingResponse(content=_dynamic_route_v1_request_generator(request))
 
 logging.info("Added dynamic routing handlers for /v1/chat/completions, /v1/completions, /v1/embeddings.")
 
@@ -345,7 +327,7 @@ logging.info("Added dynamic routing handlers for /v1/chat/completions, /v1/compl
 # If needed, add a catch-all for other /v1 paths, but be cautious
 # @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 # async def _v1_catch_all_handler(request: Request):
-#     return await _dynamic_route_v1_request(request)
+#     return await _dynamic_route_v1_request_generator(request)
 # logging.info("Added catch-all dynamic routing handler for /v1/*.")
 
 
@@ -480,7 +462,10 @@ class FastAPIProxyThread(QThread): # Renamed class
             app.state.is_model_running_callback = self.is_model_running_callback
             app.state.get_runner_port_callback = self.get_runner_port_callback # Pass the new callback
             app.state.request_runner_start_callback = self.request_runner_start_callback # Pass the new callback
-            # app.state.runner_ready_futures = self._runner_ready_futures # Pass the futures dict
+            # Extract metadata for all models and store it in app.state.models_metadata
+            app.state.models_metadata = gguf_metadata.get_all_models_lmstudio_format(
+                self.models_config, self.is_model_running_callback
+            )
 
             # Use port 1234 as required
             uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=1234, reload=False)

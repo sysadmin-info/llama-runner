@@ -319,7 +319,7 @@ class MainWindow(QWidget):
 
             # Connect signals from the status widget's buttons
             # Use lambda to pass the model_name to the slots
-            status_widget.start_button.clicked.connect(lambda checked, name=model_name: self.start_llama_runner(name))
+            status_widget.start_button.clicked.connect(lambda checked, name=model_name: self.request_runner_start(name))
             status_widget.stop_button.clicked.connect(lambda checked, name=model_name: self.stop_llama_runner(name))
 
 

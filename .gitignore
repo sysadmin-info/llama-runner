@@ -1,0 +1,3 @@
+.aider*
+dev-venv
+llama_runner/__pycache__/*

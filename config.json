@@ -15,12 +15,5 @@
         "cache-type-v": "q8_0"
       }
     }
-  },
-  "litellm-proxy": {
-    // Optional API key for the proxy itself.
-    // If this key is present, requests to the proxy must include
-    // "Authorization: Bearer <api_key>" header.
-    // If this key is commented out or absent, no API key is required.
-    // "api_key": "my-secret-proxy-key"
   }
 }

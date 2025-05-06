@@ -420,3 +420,16 @@ def get_single_model_lmstudio_format(model_name: str, models_config: Dict[str, D
 
 # Ensure cache directory exists on import
 ensure_cache_dir_exists()
+
+def get_model_name_to_id_mapping(models_config: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    """
+    Gets a mapping of model names to their IDs from the metadata.
+    """
+    mapping = {}
+    for model_name, model_config in models_config.items():
+        model_path = model_config.get("model_path")
+        if model_path:
+            metadata = get_model_lmstudio_format(model_name, model_path, False)
+            if metadata:
+                mapping[model_name] = metadata["id"]
+    return mapping

@@ -30,7 +30,6 @@ def main():
     ensure_config_exists()
 
     # Map string level to logging constant for console handler
-    log_level_console = getattr(logging, args.log_level.upper(), logging.INFO)
 
     # Get the root logger
     root_logger = logging.getLogger()
@@ -55,7 +54,19 @@ def main():
     # Create console handler
     console_handler = logging.StreamHandler(sys.stdout)
     # Set console level based on argument
-    console_handler.setLevel(log_level_console)
+    if args.log_level.upper() == "DEBUG":
+        console_handler.setLevel(logging.DEBUG)
+    elif args.log_level.upper() == "INFO":
+        console_handler.setLevel(logging.INFO)
+    elif args.log_level.upper() == "WARNING":
+        console_handler.setLevel(logging.WARNING)
+    elif args.log_level.upper() == "ERROR":
+        console_handler.setLevel(logging.ERROR)
+    elif args.log_level.upper() == "CRITICAL":
+        console_handler.setLevel(logging.CRITICAL)
+    else:
+        # Default to INFO if somehow an invalid level got through argparse
+        console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
 
