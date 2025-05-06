@@ -22,7 +22,7 @@ except ImportError:
 import uvicorn # Keep import if needed elsewhere, but proxy thread handles server
 
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                               QPushButton, QLineEdit, QTabWidget, QMessageBox,
+                               QPushButton, QLineEdit, QMessageBox,
                                QDialog, QTextEdit, QDialogButtonBox, QListWidget,
                                QStackedWidget, QSizePolicy, QSpacerItem)
 from PySide6.QtCore import QThread, QObject, Signal, Slot, Qt, QTimer # Import QTimer
@@ -69,6 +69,20 @@ class ErrorOutputDialog(QDialog):
         self.setLayout(layout)
 
 
+def human_readable_size(size_in_bytes: Optional[int]) -> str:
+    """Formats a size in bytes into a human-readable string (e.g., KB, MB, GB)."""
+    if size_in_bytes is None:
+        return "N/A"
+    if size_in_bytes < 1024:
+        return f"{size_in_bytes} B"
+    elif size_in_bytes < 1024**2:
+        return f"{size_in_bytes / 1024:.2f} KB"
+    elif size_in_bytes < 1024**3:
+        return f"{size_in_bytes / (1024**2):.2f} MB"
+    elif size_in_bytes < 1024**4:
+        return f"{size_in_bytes / (1024**3):.2f} GB"
+    else:
+        return f"{size_in_bytes / (1024**4):.2f} TB"
 class LlamaRunnerThread(QThread):
     """
     QThread to run the LlamaCppRunner in a separate thread to avoid blocking the UI.
@@ -204,10 +218,27 @@ class ModelStatusWidget(QWidget):
     """
     Widget to display status and controls for a single model.
     """
-    def __init__(self, model_name: str, parent=None):
+    def __init__(self, model_name: str, metadata: Optional[Dict[str, Any]] = None, parent=None):
         super().__init__(parent)
         self.model_name = model_name
+        self.metadata = metadata
         self.layout = QVBoxLayout()
+
+        # Metadata section
+        self.metadata_layout = QVBoxLayout()
+        self.metadata_label = QLabel("<b>Metadata:</b>")
+        self.metadata_layout.addWidget(self.metadata_label)
+
+        self.arch_label = QLabel("Architecture: N/A")
+        self.metadata_layout.addWidget(self.arch_label)
+
+        self.quant_label = QLabel("Quantization: N/A")
+        self.metadata_layout.addWidget(self.quant_label)
+
+        self.size_label = QLabel("Size: N/A")
+        self.metadata_layout.addWidget(self.size_label)
+
+        self.layout.addLayout(self.metadata_layout) # Add metadata layout to main widget layout
 
         self.model_label = QLabel(f"<b>{self.model_name}</b>")
         self.model_label.setAlignment(Qt.AlignCenter)
@@ -230,6 +261,29 @@ class ModelStatusWidget(QWidget):
         self.layout.addStretch() # Push everything to the top
 
         self.setLayout(self.layout)
+
+        # Update metadata display if metadata is provided
+        if self.metadata:
+            self.update_metadata(self.metadata)
+
+    def update_metadata(self, metadata: Dict[str, Any]):
+        """Updates the displayed metadata."""
+        self.metadata = metadata
+        self.arch_label.setText(f"Architecture: {metadata.get('arch', 'N/A')}")
+        self.quant_label.setText(f"Quantization: {metadata.get('quantization', 'N/A')}")
+        # Format size nicely, assuming size is in bytes (LM Studio format)
+        size_bytes = metadata.get('size', None)
+        if size_bytes is not None:
+            # Attempt to convert to integer as per user suggestion
+            try:
+                size_bytes_int = int(size_bytes)
+                self.size_label.setText(f"Size: {human_readable_size(size_bytes_int)}")
+            except (ValueError, TypeError):
+                 # Fallback if conversion fails (should ideally not happen if gguf_metadata is fixed)
+                 logging.warning(f"Could not convert size metadata '{size_bytes}' to integer. Displaying raw value.")
+                 self.size_label.setText(f"Size: {size_bytes}") # Display raw value if conversion fails
+        else:
+            self.size_label.setText("Size: N/A")
 
     def update_status(self, status: str):
         self.status_label.setText(f"Status: {status}")
@@ -290,22 +344,17 @@ class MainWindow(QWidget):
         self._runner_startup_futures: Dict[str, asyncio.Future] = {}
 
 
-        self.layout = QVBoxLayout()
-
-        self.tabs = QTabWidget()
-
-        # Llama Runner Tab
-        self.llama_tab = QWidget()
-        self.llama_layout = QHBoxLayout() # Use QHBoxLayout for side-by-side layout
+        # Use QHBoxLayout for side-by-side layout
+        self.layout = QHBoxLayout() # Main layout is now QHBoxLayout
 
         # Left side: Model List
         self.model_list_widget = QListWidget()
         self.model_list_widget.setMinimumWidth(150) # Give the list some space
-        self.llama_layout.addWidget(self.model_list_widget)
+        self.layout.addWidget(self.model_list_widget)
 
         # Right side: Model Status Stack
         self.model_status_stack = QStackedWidget()
-        self.llama_layout.addWidget(self.model_status_stack)
+        self.layout.addWidget(self.model_status_stack)
 
         self.model_status_widgets: Dict[str, ModelStatusWidget] = {} # Store status widgets by model name
 
@@ -313,7 +362,9 @@ class MainWindow(QWidget):
         for model_name in self.models.keys():
             self.model_list_widget.addItem(model_name)
 
-            status_widget = ModelStatusWidget(model_name)
+            # Get metadata for the model
+            model_metadata = self.model_metadata_cache.get(model_name)
+            status_widget = ModelStatusWidget(model_name, metadata=model_metadata)
             self.model_status_stack.addWidget(status_widget)
             self.model_status_widgets[model_name] = status_widget
 
@@ -337,26 +388,7 @@ class MainWindow(QWidget):
         self.model_status_stack.setCurrentWidget(self.no_model_selected_widget) # Show placeholder initially
 
 
-        self.llama_tab.setLayout(self.llama_layout)
-        self.tabs.addTab(self.llama_tab, "Llama Runner")
-
-        # LiteLLM Proxy Tab (Updated label)
-        self.fastapi_proxy_tab = QWidget()
-        self.fastapi_proxy_layout = QVBoxLayout()
-        self.fastapi_proxy_layout.addWidget(QLabel("FastAPI Proxy Status:")) # Updated label
-        self.fastapi_proxy_status_label = QLabel("Not Running") # Updated variable name
-        self.fastapi_proxy_layout.addWidget(self.fastapi_proxy_status_label) # Updated variable name
-        # Remove start/stop buttons for proxy, it starts automatically
-        # self.litellm_start_button = QPushButton("Start LiteLLM Proxy")
-        # self.litellm_stop_button = QPushButton("Stop LiteLLM Proxy")
-        # self.litellm_stop_button.setEnabled(False) # Initially disabled
-        # self.litellm_layout.addWidget(self.litellm_start_button)
-        # self.litellm_layout.addWidget(self.litellm_stop_button)
-        self.fastapi_proxy_layout.addStretch()
-        self.fastapi_proxy_tab.setLayout(self.fastapi_proxy_layout)
-        self.tabs.addTab(self.fastapi_proxy_tab, "FastAPI Proxy") # Updated tab title
-
-        self.layout.addWidget(self.tabs)
+        # The main layout now contains the model list and status stack directly
         self.setLayout(self.layout)
 
         # Connect buttons to actions (removed proxy buttons)
@@ -610,7 +642,6 @@ class MainWindow(QWidget):
 
         print("Starting FastAPI Proxy...") # Updated print
         # Updated status label variable name
-        self.fastapi_proxy_status_label.setText("Running...")
         # Proxy buttons are removed, status label is enough
 
         # Removed: proxy_api_key = self.litellm_proxy_config.get("api_key") # LiteLLM config removed
@@ -649,7 +680,6 @@ class MainWindow(QWidget):
         if self.fastapi_proxy_thread and self.fastapi_proxy_thread.isRunning():
             print("Stopping FastAPI Proxy...") # Updated print
             # Updated status label variable name
-            self.fastapi_proxy_status_label.setText("Stopping...")
             # Proxy buttons are removed
 
             # Updated variable name
@@ -659,12 +689,10 @@ class MainWindow(QWidget):
             # A signal from the proxy thread would be better here.
             # For now, manually update status after signaling stop
             # Updated status label variable name
-            self.fastapi_proxy_status_label.setText("Not Running")
 
         else:
             print("FastAPI Proxy is not running.") # Updated print
             # Updated status label variable name
-            self.fastapi_proxy_status_label.setText("Not Running")
 
 
     @Slot(str)
@@ -770,34 +798,3 @@ class MainWindow(QWidget):
 
         # Emit signal for the proxy thread
         self.runner_port_ready_for_proxy.emit(model_name, port)
-
-
-    # Optional: Slots for proxy thread signals if added later
-    # @Slot()
-    # def on_fastapi_proxy_started(self): # Updated method name
-    #     print("FastAPI Proxy started.") # Updated print
-    #     self.fastapi_proxy_status_label.setText("Running") # Updated variable name
-    #     # self.litellm_start_button.setEnabled(False) # Removed button
-    #     # self.litellm_stop_button.setEnabled(True) # Removed button
-
-    # @Slot()
-    # def on_fastapi_proxy_stopped(self): # Updated method name
-    #     print("FastAPI Proxy stopped.") # Updated print
-    #     self.fastapi_proxy_status_label.setText("Not Running") # Updated variable name
-    #     # self.litellm_start_button.setEnabled(True) # Removed button
-    #     # self.litellm_stop_button.setEnabled(False) # Removed button
-
-    # @Slot(str)
-    # def on_fastapi_proxy_error(self, message: str): # Updated method name
-    #     print(f"FastAPI Proxy error: {message}") # Updated print
-    #     self.fastapi_proxy_status_label.setText(f"Error: {message}") # Updated variable name
-    #     # self.litellm_start_button.setEnabled(True) # Removed button
-    #     # self.litellm_stop_button.setEnabled(False) # Removed button
-
-
-# The main function is now in main.py
-# async def main():
-#    pass # REMOVE
-
-# if __name__ == "__main__":
-#    pass # REMOVE

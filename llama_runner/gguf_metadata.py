@@ -348,6 +348,8 @@ def get_model_lmstudio_format(model_name: str, model_path: str, is_running: bool
         metadata = extract_gguf_metadata(model_path)
         if metadata:
              metadata["state"] = "loaded" if is_running else "not-loaded"
+             # Add file size to the metadata, formatted human-readable
+             metadata["size"] = file_size
         return metadata
 
 
@@ -363,6 +365,8 @@ def get_model_lmstudio_format(model_name: str, model_path: str, is_running: bool
         if extracted_metadata:
             # Add state and save to cache
             extracted_metadata["state"] = "loaded" if is_running else "not-loaded"
+            # Add file size to the metadata, formatted human-readable
+            extracted_metadata["size"] = file_size
             save_metadata_to_cache(model_name, file_size, extracted_metadata)
             return extracted_metadata
         else:

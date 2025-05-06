@@ -3,6 +3,7 @@ import logging # Import logging
 import argparse # Import argparse
 import os # Import os
 from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QIcon # Import QIcon
 
 # Import CONFIG_DIR and ensure_config_exists
 from llama_runner.config_loader import CONFIG_DIR, ensure_config_exists
@@ -88,6 +89,9 @@ def main():
 
     # Create the Qt application instance
     app = QApplication(sys.argv)
+
+    # Set the application icon
+    app.setWindowIcon(QIcon('app_icon.png'))
 
     # Create the main window instance
     window = MainWindow()
