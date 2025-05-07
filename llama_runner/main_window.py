@@ -244,8 +244,58 @@ class ModelStatusWidget(QWidget):
         self.layout.addWidget(self.stop_button)
 
         self.layout.addStretch() # Push everything to the top
-
         self.setLayout(self.layout)
+        # Apply styling to the ModelStatusWidget and its children
+        self.setStyleSheet("""
+            ModelStatusWidget {
+                background-color: #ffffff;
+                border: 1px solid #dddddd;
+                border-radius: 8px;
+                padding: 15px; /* Add padding to the widget */
+                margin: 10px; /* Add margin around the widget */
+            }
+            QLabel {
+                font-size: 10pt; /* Default label font size */
+                margin-bottom: 5px;
+            }
+            QLabel:first-child { /* Style for the "Metadata:" label */
+                 font-weight: bold;
+                 margin-bottom: 10px;
+            }
+            QLabel[text^="Architecture:"],
+            QLabel[text^="Quantization:"],
+            QLabel[text^="Size:"] {
+                 font-size: 9pt; /* Smaller font for metadata details */
+                 color: #555555;
+                 margin-left: 10px; /* Indent metadata details */
+            }
+            QLabel[text^="Status:"] {
+                 font-weight: bold;
+                 margin-top: 10px;
+            }
+            QLabel[text^="Port:"] {
+                 font-weight: bold;
+            }
+            QPushButton {
+                background-color: #007bff; /* Primary button color */
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 10px 15px; /* Padding for buttons */
+                font-size: 10pt;
+                margin-top: 10px;
+            }
+            QPushButton:hover {
+                background-color: #0056b3; /* Darker color on hover */
+            }
+            QPushButton:pressed {
+                background-color: #004085; /* Even darker color when pressed */
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #666666;
+            }
+        """)
 
         # Update metadata display if metadata is provided
         if self.metadata:
@@ -336,6 +386,24 @@ class MainWindow(QWidget):
         # Left side: Model List
         self.model_list_widget = QListWidget()
         self.model_list_widget.setMinimumWidth(150) # Give the list some space
+        # Style the model list
+        self.model_list_widget.setStyleSheet("""
+            QListWidget {
+                border: 0;
+                border-radius: 5px;
+                padding: 5px;
+                background-color: #f0f0f0;
+            }
+            QListWidget::item {
+                padding: 8px; /* Add padding to list items */
+                font-size: 12pt; /* Increase font size */
+                margin-bottom: 4px; /* Add space between items */
+            }
+            QListWidget::item:selected {
+                background-color: #a0c0f0; /* Highlight color */
+                color: #333333;
+            }
+        """)
         self.layout.addWidget(self.model_list_widget)
 
         # Right side: Model Status Stack
@@ -531,7 +599,22 @@ class MainWindow(QWidget):
         model_config = self.models[model_name]
         model_path = model_config.get("model_path")
         llama_cpp_runtime_key = model_config.get("llama_cpp_runtime", "default")
-        llama_cpp_runtime = self.llama_runtimes.get(llama_cpp_runtime_key, self.default_runtime)
+        _raw_llama_cpp_runtime_config = self.llama_runtimes.get(llama_cpp_runtime_key, self.default_runtime)
+        
+        # Extract the actual runtime command string
+        if isinstance(_raw_llama_cpp_runtime_config, dict):
+            llama_cpp_runtime_command = _raw_llama_cpp_runtime_config.get("runtime")
+            if not llama_cpp_runtime_command: # Should not happen if config_loader is correct
+                logging.error(f"Runtime configuration for '{llama_cpp_runtime_key}' is a dict but missing 'runtime' key.")
+                future.set_exception(RuntimeError(f"Invalid runtime config for '{llama_cpp_runtime_key}'."))
+                return future
+        elif isinstance(_raw_llama_cpp_runtime_config, str):
+            llama_cpp_runtime_command = _raw_llama_cpp_runtime_config
+        else:
+            # This case should ideally not be reached if config_loader normalizes correctly
+            logging.error(f"Unexpected type for runtime configuration '{llama_cpp_runtime_key}': {type(_raw_llama_cpp_runtime_config)}")
+            future.set_exception(RuntimeError(f"Invalid runtime configuration type for '{llama_cpp_runtime_key}'."))
+            return future
 
         if not model_path:
              logging.error(f"Configuration Error: Model '{model_name}' has no 'model_path' specified in config.json.")
@@ -545,9 +628,9 @@ class MainWindow(QWidget):
              return future
 
         # Check if the runtime executable exists if it's not the default "llama-server" (which is expected in PATH)
-        if llama_cpp_runtime_key != "default" and not os.path.exists(llama_cpp_runtime):
-             logging.error(f"Runtime Not Found: Llama.cpp runtime not found: {llama_cpp_runtime}")
-             future.set_exception(FileNotFoundError(f"Llama.cpp runtime not found: {llama_cpp_runtime}"))
+        if llama_cpp_runtime_key != "default" and not os.path.exists(llama_cpp_runtime_command):
+             logging.error(f"Runtime Not Found: Llama.cpp runtime not found: {llama_cpp_runtime_command}")
+             future.set_exception(FileNotFoundError(f"Llama.cpp runtime not found: {llama_cpp_runtime_command}"))
              return future
 
 
@@ -561,7 +644,7 @@ class MainWindow(QWidget):
         thread = LlamaRunnerThread(
             model_name=model_name,
             model_path=model_path,
-            llama_cpp_runtime=llama_cpp_runtime,
+            llama_cpp_runtime=llama_cpp_runtime_command,
             **model_config.get("parameters", {})
         )
         # Connect signals
@@ -640,7 +723,8 @@ class MainWindow(QWidget):
         # Pass models config and the necessary callback methods to the proxy thread
         # Updated class name
         self.fastapi_proxy_thread = FastAPIProxyThread(
-            models_config=self.models,
+            all_models_config=self.models, # Pass the main models configuration
+            runtimes_config=self.llama_runtimes, # Pass the runtimes configuration
             is_model_running_callback=self.is_llama_runner_running, # Pass the callback method
             get_runner_port_callback=self.get_runner_port, # Pass the callback method
             request_runner_start_callback=self.request_runner_start, # Pass the callback method
@@ -675,7 +759,8 @@ class MainWindow(QWidget):
 
         # Pass the necessary callback methods to the proxy thread
         self.ollama_proxy_thread = OllamaProxyThread(
-            models_config=self.models, # Pass the models configuration
+            all_models_config=self.models, # Pass the main models configuration
+            runtimes_config=self.llama_runtimes, # Pass the runtimes configuration
             is_model_running_callback=self.is_llama_runner_running, # Pass the callback method
             get_runner_port_callback=self.get_runner_port, # Pass the callback method
             request_runner_start_callback=self.request_runner_start, # Pass the callback method

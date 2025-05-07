@@ -1,12 +1,10 @@
 import asyncio
-import os
 import subprocess
 import logging
 import re
 import collections # Import collections
-from typing import Dict, Any
 
-from llama_runner.config_loader import load_config, CONFIG_DIR, LOG_FILE
+from llama_runner.config_loader import CONFIG_DIR, LOG_FILE
 
 # Configure logging
 logging.basicConfig(filename=LOG_FILE, level=logging.ERROR,
@@ -30,6 +28,7 @@ class LlamaCppRunner:
         self.kwargs = kwargs
         self.process: subprocess.Popen = None
         self.startup_pattern = re.compile(r"main: server is listening on")  # Regex to detect startup
+        self.alt_startup_pattern = re.compile("HTTP server listening")      # ik.llama
         self.port = None #Dynamically assigned port
         self._output_buffer = collections.deque(maxlen=10) # Store the last 10 lines read from stdout
 
@@ -46,11 +45,13 @@ class LlamaCppRunner:
             "--model", self.model_path,
             "--alias", self.model_name,
             "--host", "127.0.0.1",  # Bind to localhost
-            "--port", "0"             # Dynamically assigned port
+            "--port", "0" if "port" not in self.kwargs else str(self.kwargs["port"])  # Dynamically assigned port unless specified
         ]
 
         # Add additional arguments from kwargs
         for key, value in self.kwargs.items():
+            if key == "port":
+                continue # already handled above
             arg_name = key.replace("_", "-")  # Convert snake_case to kebab-case
             # Handle boolean flags: if value is True, just add the flag, otherwise skip
             if isinstance(value, bool):
@@ -153,21 +154,32 @@ class LlamaCppRunner:
                 print(f"llama.cpp[{self.model_name}]: {decoded_line}")
 
                 match = self.startup_pattern.search(decoded_line)
-                if match:
+                alt_match = self.alt_startup_pattern.search(decoded_line)
+                if match or alt_match:
                     print(f"llama.cpp server for {self.model_name} started successfully.")
                     # Extract port from the startup message
-                    port_match = re.search(r'http://127\.0\.0\.1:(\d+)', decoded_line)
-                    if port_match:
-                        self.port = int(port_match.group(1))
-                        print(f"llama.cpp server for {self.model_name} is listening on port {self.port}")
-                    else:
-                         # Startup line found, but port not extracted - this is also a failure
-                         print(f"Warning: Startup line found but port could not be extracted for {self.model_name}.")
-                         # The error message will be generic, the UI will show the buffer
-                         return False # Indicate failure if port isn't found
-
+                    if match: 
+                        port_match = re.search(r'http://127\.0\.0\.1:(\d+)', decoded_line)
+                        if port_match:
+                            self.port = int(port_match.group(1))
+                            print(f"llama.cpp server for {self.model_name} is listening on port {self.port}")
+                        else:
+                            # Startup line found, but port not extracted - this is also a failure
+                            print(f"Warning: Startup line found but port could not be extracted for {self.model_name}.")
+                            # The error message will be generic, the UI will show the buffer
+                            return False # Indicate failure if port isn't found
+                    elif alt_match:
+                        port_match = re.search(r'port="(\d+)"', decoded_line)
+                        if port_match:
+                            self.port = int(port_match.group(1))
+                            print(f"llama.cpp server for {self.model_name} is listening on port {self.port}")
+                        else:
+                            # Startup line found, but port not extracted - this is also a failure
+                            print(f"Warning: Startup line found but port could not be extracted for {self.model_name}.")
+                            # The error message will be generic, the UI will show the buffer
+                            return False # Indicate failure if port isn't found
                     return True # Startup successful
-
+                
                 # Check if process exited after reading a line
                 if self.process.returncode is not None:
                     print(f"Process for {self.model_name} exited after reading a line.")

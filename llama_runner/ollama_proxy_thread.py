@@ -13,6 +13,7 @@ import uvicorn
 from PySide6.QtCore import QThread, Slot
 
 from llama_runner import gguf_metadata
+# Removed import: from llama_runner.config_loader import calculate_system_fingerprint
 from llama_runner.ollama_proxy_conversions import (
     embeddingRequestFromOllama, embeddingResponseToOllama,
     generateRequestFromOllama, generateResponseToOllama,
@@ -33,77 +34,115 @@ async def _dynamic_route_runner_request_generator(request: Request, target_path:
     This is an async generator function for streaming responses.
     """
     # Access state and callbacks from the request's app instance
-    models_config = request.app.state.models_config
+    all_models_config = request.app.state.all_models_config # Use all_models_config
+    runtimes_config = request.app.state.runtimes_config # Use runtimes_config
     get_runner_port_callback = request.app.state.get_runner_port_callback
     request_runner_start_callback = request.app.state.request_runner_start_callback
     # Access the proxy thread instance to get the futures dictionary
     proxy_thread: OllamaProxyThread = request.app.state.proxy_thread_instance
 
-    model_name = request_body.get("model")
-    if not model_name:
+    model_name_from_request = request_body.get("model")
+    if not model_name_from_request:
         logging.warning(f"Model name not found in request body for {request.url.path}")
         yield b'data: {"error": "Model name not specified in request body."}\n\n'
         return # Stop the generator
 
-    logging.debug(f"Intercepted request for model: {model_name} at path: {request.url.path}")
-    logging.debug(f"Available models in models_config: {list(models_config.keys())}")
+    logging.debug(f"Intercepted request for model: {model_name_from_request} at path: {request.url.path}")
+    logging.debug(f"Available models in all_models_config: {list(all_models_config.keys())}")
+    logging.debug(f"Available runtimes in runtimes_config: {list(runtimes_config.keys())}")
 
-    # Check if the model exists in the configuration
-    if model_name not in models_config:
-        logging.warning(f"Request for unknown model: {model_name}")
-        yield f"data: {{\"error\": \"Model '{model_name}' not found in configuration.\"}}\n\n".encode('utf-8')
+    # Check if the model exists in the all_models_config
+    if model_name_from_request not in all_models_config:
+        logging.warning(f"Request for unknown model: {model_name_from_request}")
+        yield f"data: {{\"error\": \"Model '{model_name_from_request}' not found in main configuration.\"}}\n\n".encode('utf-8')
         return # Stop the generator
 
-    # Check if the runner is already running
-    port = get_runner_port_callback(model_name)
+    # Get the specific model's configuration details from all_models_config
+    model_config_details = all_models_config.get(model_name_from_request)
+    runtime_name_for_model = model_config_details.get("llama_cpp_runtime") if model_config_details else None
+
+    if not runtime_name_for_model:
+        logging.warning(f"Runtime not defined for model '{model_name_from_request}' in main configuration.")
+        yield f"data: {{\"error\": \"Runtime not configured for model '{model_name_from_request}'.\"}}\n\n".encode('utf-8')
+        return
+
+    # Get the runtime's configuration from runtimes_config
+    runtime_details_from_config = runtimes_config.get(runtime_name_for_model)
+
+    if not runtime_details_from_config:
+        logging.warning(f"Configuration for runtime '{runtime_name_for_model}' (for model '{model_name_from_request}') not found in runtimes configuration.")
+        yield f"data: {{\"error\": \"Configuration for runtime '{runtime_name_for_model}' not found.\"}}\n\n".encode('utf-8')
+        return
+
+    # Conditionally remove 'tools' and 'tool_choice' from the request body
+    # This is done if the runtime's configuration specifies 'supports_tools': False.
+    if runtime_details_from_config.get("supports_tools") is False:
+        tools_present_in_request = "tools" in request_body
+        tool_choice_present_in_request = "tool_choice" in request_body
+
+        if tools_present_in_request:
+            request_body.pop("tools")
+        if tool_choice_present_in_request:
+            request_body.pop("tool_choice")
+
+        if tools_present_in_request or tool_choice_present_in_request:
+            logging.info(
+                f"Model '{model_name_from_request}' (using runtime: '{runtime_name_for_model}') "
+                f"has supports_tools=False. Removed 'tools' and/or 'tool_choice' from request to {target_path}."
+            )
+            # request_body is modified in place, and httpx will use the modified version
+            # when 'json=request_body' is passed to client.stream()
+
+    # Check if the runner is already running using model_name_from_request
+    port = get_runner_port_callback(model_name_from_request)
 
     if port is None:
         # Runner is not running, request startup and wait
-        logging.info(f"Runner for {model_name} not running. Requesting startup.")
+        logging.info(f"Runner for {model_name_from_request} not running. Requesting startup.")
         try:
             # Request startup via the callback, which returns an asyncio.Future
             # Store the future locally in the proxy thread instance
-            if model_name not in proxy_thread._runner_ready_futures or proxy_thread._runner_ready_futures[model_name].done():
-                 logging.debug(f"Creating new startup future for {model_name}")
-                 proxy_thread._runner_ready_futures[model_name] = request_runner_start_callback(model_name)
+            if model_name_from_request not in proxy_thread._runner_ready_futures or proxy_thread._runner_ready_futures[model_name_from_request].done():
+                 logging.debug(f"Creating new startup future for {model_name_from_request}")
+                 proxy_thread._runner_ready_futures[model_name_from_request] = request_runner_start_callback(model_name_from_request)
             else:
-                 logging.debug(f"Using existing startup future for {model_name}")
+                 logging.debug(f"Using existing startup future for {model_name_from_request}")
 
             # Wait for the runner to become ready (Future to resolve)
             # Use a timeout to prevent infinite waiting
             startup_timeout = 60 # seconds
             port = await asyncio.wait_for(
-                proxy_thread._runner_ready_futures[model_name],
+                proxy_thread._runner_ready_futures[model_name_from_request],
                 timeout=startup_timeout
             )
-            logging.info(f"Runner for {model_name} is ready on port {port} after startup.")
+            logging.info(f"Runner for {model_name_from_request} is ready on port {port} after startup.")
 
         except asyncio.TimeoutError:
-            logging.error(f"Timeout waiting for runner {model_name} to start after {startup_timeout} seconds.")
+            logging.error(f"Timeout waiting for runner {model_name_from_request} to start after {startup_timeout} seconds.")
             # Clean up the future if it timed out
-            if model_name in proxy_thread._runner_ready_futures and not proxy_thread._runner_ready_futures[model_name].done():
-                 proxy_thread._runner_ready_futures[model_name].cancel() # Cancel the future
-                 del proxy_thread._runner_ready_futures[model_name]
-            yield f"data: {{\"error\": \"Timeout starting runner for model '{model_name}'.\"}}\n\n".encode('utf-8')
+            if model_name_from_request in proxy_thread._runner_ready_futures and not proxy_thread._runner_ready_futures[model_name_from_request].done():
+                 proxy_thread._runner_ready_futures[model_name_from_request].cancel() # Cancel the future
+                 del proxy_thread._runner_ready_futures[model_name_from_request]
+            yield f"data: {{\"error\": \"Timeout starting runner for model '{model_name_from_request}'.\"}}\n\n".encode('utf-8')
             return # Stop the generator
         except Exception as e:
-            logging.error(f"Error during runner startup for {model_name}: {e}\n{traceback.format_exc()}")
+            logging.error(f"Error during runner startup for {model_name_from_request}: {e}\n{traceback.format_exc()}")
             # Clean up the future if it failed
-            if model_name in proxy_thread._runner_ready_futures and not proxy_thread._runner_ready_futures[model_name].done():
-                 proxy_thread._runner_ready_futures[model_name].set_exception(e) # Set exception on the future
-                 del proxy_thread._runner_ready_futures[model_name]
-            yield f"data: {{\"error\": \"Error starting runner for model '{model_name}': {e}\"}}\n\n".encode('utf-8')
+            if model_name_from_request in proxy_thread._runner_ready_futures and not proxy_thread._runner_ready_futures[model_name_from_request].done():
+                 proxy_thread._runner_ready_futures[model_name_from_request].set_exception(e) # Set exception on the future
+                 del proxy_thread._runner_ready_futures[model_name_from_request]
+            yield f"data: {{\"error\": \"Error starting runner for model '{model_name_from_request}': {e}\"}}\n\n".encode('utf-8')
             return # Stop the generator
 
     else:
-        logging.debug(f"Runner for {model_name} is already running on port {port}.")
+        logging.debug(f"Runner for {model_name_from_request} is already running on port {port}.")
         # If it was running, ensure its future is marked as done with the port
         # This handles cases where the proxy restarts but the runner is still alive
-        if model_name not in proxy_thread._runner_ready_futures or not proxy_thread._runner_ready_futures[model_name].done():
-             logging.debug(f"Creating completed future for already running runner {model_name}")
+        if model_name_from_request not in proxy_thread._runner_ready_futures or not proxy_thread._runner_ready_futures[model_name_from_request].done():
+             logging.debug(f"Creating completed future for already running runner {model_name_from_request}")
              future = asyncio.Future()
              future.set_result(port)
-             proxy_thread._runner_ready_futures[model_name] = future
+             proxy_thread._runner_ready_futures[model_name_from_request] = future
              # No need for timer cleanup here, as it's already running.
              # The future will be removed if the runner stops later.
 
@@ -111,7 +150,7 @@ async def _dynamic_route_runner_request_generator(request: Request, target_path:
     # Runner is ready and port is known. Forward the request.
     target_url = f"http://127.0.0.1:{port}{target_path}"
     logging.debug(f"Target URL: {target_url}")
-    logging.debug(f"Forwarding request for {model_name} to {target_url}")
+    logging.debug(f"Forwarding request for {model_name_from_request} to {target_url}")
 
     # Use httpx to forward the request and yield chunks directly
     async with httpx.AsyncClient() as client:
@@ -134,24 +173,23 @@ async def _dynamic_route_runner_request_generator(request: Request, target_path:
                 # Check if the response is streaming (e.g., Server-Sent Events)
                 content_type = proxy_response.headers.get('content-type', '').lower()
                 if 'text/event-stream' in content_type:
-                     logging.debug(f"Forwarding streaming response from {target_url}")
-                     # Yield chunks directly from the httpx stream within this generator
-                     async for chunk in proxy_response.aiter_bytes():
+                    logging.debug(f"Forwarding streaming response from {target_url}")
+                    # Yield chunks directly from the httpx stream within this generator
+                    async for chunk in proxy_response.aiter_bytes():
                         yield chunk # Yield each chunk as it arrives
                 else:
-                     logging.debug(f"Forwarding non-streaming response from {target_url}")
-                     # For non-streaming responses, read the body and yield it as a single chunk
-                     response_body = await proxy_response.aread() # Read the entire body asynchronously
-                     yield response_body # Yield the entire body as one chunk
-
+                    logging.debug(f"Forwarding non-streaming response from {target_url}")
+                    # For non-streaming responses, read the body and yield it as a single chunk
+                    response_body = await proxy_response.aread() # Read the entire body asynchronously
+                    yield response_body # Yield the original body as one chunk
 
         except httpx.RequestError as e:
-            logging.error(f"Error forwarding request to runner {model_name} on port {port}: {e}\n{traceback.format_exc()}")
-            yield f'data: {{"error": "Error communicating with runner for model \'{model_name}\': {e}"}}\n\n'.encode('utf-8')
+            logging.error(f"Error forwarding request to runner {model_name_from_request} on port {port}: {e}\n{traceback.format_exc()}")
+            yield f'data: {{"error": "Error communicating with runner for model \'{model_name_from_request}\': {e}"}}\n\n'.encode('utf-8')
 
         except Exception as e:
-            logging.error(f"Unexpected error during request forwarding for {model_name}: {e}\n{traceback.format_exc()}")
-            yield f'data: {{"error": "Internal error processing request for model \'{model_name}\': {e}"}}\n\n'.encode('utf-8')
+            logging.error(f"Unexpected error during request forwarding for {model_name_from_request}: {e}\n{traceback.format_exc()}")
+            yield f'data: {{"error": "Internal error processing request for model \'{model_name_from_request}\': {e}"}}\n\n'.encode('utf-8')
 
 # --- End handler for dynamic routing ---
 
@@ -292,9 +330,10 @@ async def generate_embeddings(request: Request):
 async def list_models(request: Request):
     """Handles Ollama /api/tags requests."""
     try:
-        models_config = request.app.state.models_config
+        # Access the main models configuration from app.state
+        all_models_config = request.app.state.all_models_config
         model_list = []
-        for name, config in models_config.items():
+        for name, config in all_models_config.items(): # Iterate over all_models_config
             # Construct the model dictionary based on the expected format
             # Assuming config contains 'modified_at', 'size', 'digest', and 'details'
             model_entry = {
@@ -326,13 +365,13 @@ async def show_model_info(request: Request):
         if not model_name:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Model name not specified in request body")
 
-        models_config = request.app.state.models_config
+        models_config = request.app.state.all_models_config # Corrected state variable name
 
         if model_name not in models_config:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model '{model_name}' not found")
 
         model_config = models_config[model_name]
-        model_path = model_config.get("path")
+        model_path = model_config.get("model_path")
 
         if not model_path:
              # This shouldn't happen if models_config is correctly populated, but handle defensively
@@ -341,10 +380,16 @@ async def show_model_info(request: Request):
 
         # Access or load GGUF metadata
         try:
-            # Assuming gguf_metadata.get_metadata handles caching internally
-            metadata = gguf_metadata.get_metadata(model_path)
-            chat_template = metadata.get("chat_template", "")
-            model_info = metadata
+            # Use get_model_lmstudio_format to get metadata, including running state
+            is_running = request.app.state.proxy_thread_instance.is_model_running_callback(model_name)
+            metadata = gguf_metadata.get_model_lmstudio_format(model_name, model_path, is_running)
+
+            if not metadata:
+                 logging.error(f"Failed to get metadata for {model_name} at {model_path}")
+                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to get metadata for model '{model_name}'")
+
+            chat_template = metadata.get("raw_metadata", {}).get("chat_template", "") # Get chat_template from raw_metadata
+            model_info = metadata # Use the full LM Studio format metadata
         except Exception as e:
             logging.error(f"Error accessing GGUF metadata for {model_name} at {model_path}: {e}\n{traceback.format_exc()}")
             # Decide whether to raise an error or return partial info.
@@ -390,7 +435,7 @@ async def show_model_info(request: Request):
 async def list_openai_models(request: Request):
     """Handles OpenAI /v1/models requests."""
     try:
-        models_config = request.app.state.models_config
+        models_config = request.app.state.all_models_config # Corrected state variable name
         model_list = []
         # Placeholder values for fields not available in models_config
         created_placeholder = 1678880000 # Example timestamp
@@ -502,12 +547,14 @@ class OllamaProxyThread(QThread):
     # error = Signal(str)
 
     def __init__(self,
-                 models_config: Dict[str, Dict[str, Any]],
+                 all_models_config: Dict[str, Dict[str, Any]], # Renamed models_config to all_models_config
+                 runtimes_config: Dict[str, Dict[str, Any]], # Renamed models_config to runtimes_config
                  is_model_running_callback: Callable[[str], bool],
                  get_runner_port_callback: Callable[[str], Optional[int]],
                  request_runner_start_callback: Callable[[str], asyncio.Future]):
         super().__init__()
-        self.models_config = models_config
+        self.all_models_config = all_models_config # Store all_models_config
+        self.runtimes_config = runtimes_config # Store runtimes_config
         self.is_model_running_callback = is_model_running_callback
         self.get_runner_port_callback = get_runner_port_callback
         self.request_runner_start_callback = request_runner_start_callback
@@ -592,7 +639,8 @@ class OllamaProxyThread(QThread):
         try:
             # Set state on the global app instance BEFORE creating the server
             # This state will be accessible by the standalone handler functions
-            app.state.models_config = self.models_config
+            app.state.all_models_config = self.all_models_config # Pass all_models_config
+            app.state.runtimes_config = self.runtimes_config # Pass runtimes_config
             app.state.is_model_running_callback = self.is_model_running_callback
             app.state.get_runner_port_callback = self.get_runner_port_callback
             app.state.request_runner_start_callback = self.request_runner_start_callback

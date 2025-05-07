@@ -48,12 +48,58 @@ def load_config():
     try:
         with open(CONFIG_FILE, "r") as f:
             config = json.load(f)
-            print(f"Loaded config: {config}")  # Print loaded config
+
+            # Process llama-runtimes to normalize structure
+            raw_runtimes = config.get("llama-runtimes")
+            if isinstance(raw_runtimes, dict):
+                processed_runtimes = {}
+                for name, details in raw_runtimes.items():
+                    if isinstance(details, str):  # Old format: "runtime_name": "command"
+                        if details.strip(): # Ensure command is not empty
+                            processed_runtimes[name] = {
+                                "runtime": details,
+                                "supports_tools": True  # Default for old format
+                            }
+                        else:
+                            logging.warning(f"Config: Runtime entry '{name}' (old format) has an empty command. Skipping.")
+                            print(f"Warning: Config: Runtime entry '{name}' (old format) has an empty command. Skipping.")
+                    elif isinstance(details, dict): # New format: "runtime_name": {"runtime": "command", "supports_tools": False/True}
+                        if "runtime" in details:
+                            runtime_cmd = details["runtime"]
+                            if isinstance(runtime_cmd, str) and runtime_cmd.strip(): # Check if runtime command is a non-empty string
+                                processed_runtimes[name] = {
+                                    "runtime": runtime_cmd,
+                                    "supports_tools": details.get("supports_tools", True)
+                                }
+                            else: # Invalid or empty runtime command
+                                logging.warning(f"Config: Runtime entry '{name}' has an invalid or empty 'runtime' command value. Skipping.")
+                                print(f"Warning: Config: Runtime entry '{name}' has an invalid or empty 'runtime' command value. Skipping.")
+                        else: # 'runtime' key is missing
+                            logging.warning(f"Config: Runtime entry '{name}' in 'llama-runtimes' is missing 'runtime' key. Skipping.")
+                            print(f"Warning: Config: Runtime entry '{name}' in 'llama-runtimes' is missing 'runtime' key. Skipping.")
+                    else: # Invalid type for runtime details
+                        logging.warning(f"Config: Runtime entry '{name}' in 'llama-runtimes' has invalid format (expected string or dict). Skipping.")
+                        print(f"Warning: Config: Runtime entry '{name}' in 'llama-runtimes' has invalid format. Skipping.")
+                config["llama-runtimes"] = processed_runtimes # Update config with processed runtimes
+            elif raw_runtimes is not None: # 'llama-runtimes' exists but is not a dictionary
+                logging.warning("Config: 'llama-runtimes' key exists but is not a dictionary. Ignoring.")
+                print("Warning: Config: 'llama-runtimes' key exists but is not a dictionary. Ignoring.")
+            # If 'llama-runtimes' is not in config or is None, it's handled gracefully (no changes made to it)
+
+            print(f"Loaded config (processed): {config}")  # Print loaded config
             return config
     except (OSError, json.JSONDecodeError) as e:
         print(f"Error loading config file: {e}")
         logging.error(f"Error loading config file: {e}")
         return {}
+
+def calculate_system_fingerprint(config: dict) -> str:
+    """Calculates a 16-character hash of the configuration parameters."""
+    import hashlib
+    import json
+    config_str = json.dumps(config, sort_keys=True)
+    hash_object = hashlib.md5(config_str.encode())
+    return hash_object.hexdigest()[:16]
 
 if __name__ == '__main__':
     # Example usage:

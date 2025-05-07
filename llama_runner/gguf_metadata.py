@@ -81,13 +81,52 @@ def load_metadata_from_cache(model_name: str, file_size: int) -> Optional[Dict[s
             return None
     return None
 
+# Helper function to prepare data for JSON serialization
+def prepare_for_json(data: Any) -> Any:
+    """
+    Recursively prepares data for JSON serialization by converting
+    unsupported types like numpy arrays/memmaps.
+    """
+    if isinstance(data, dict):
+        return {k: prepare_for_json(v) for k, v in data.items()}
+    elif isinstance(data, (list, tuple)):
+        return [prepare_for_json(item) for item in data]
+    elif NUMPY_AVAILABLE and isinstance(data, (np.ndarray, np.memmap)):
+        if data.size == 1:
+            # Convert singleton numpy arrays to their scalar item
+            try:
+                return data.item()
+            except Exception:
+                # Fallback to string representation if item() fails
+                return str(data)
+        elif data.ndim == 1:
+            # Convert 1D arrays to string representation
+            try:
+                if data.dtype == np.uint8 or data.dtype == np.int8:
+                    # Assume bytes and decode
+                    return bytes(data).decode('utf-8', errors='replace')
+                else:
+                    # Convert numeric array to string
+                    return np.array2string(data, separator=', ', max_line_width=np.inf)
+            except Exception:
+                # Fallback to generic string representation
+                return str(data)
+        else:
+            # Convert other numpy arrays to string representation
+            return str(data)
+    else:
+        # Return the data as is if it's already JSON serializable
+        return data
+
 # Updated to use file_size instead of file_hash
 def save_metadata_to_cache(model_name: str, file_size: int, metadata: Dict[str, Any]):
     """Saves metadata to a cache file."""
     cache_path = get_metadata_cache_path(model_name, file_size)
     try:
+        # Prepare metadata for JSON serialization
+        prepared_metadata = prepare_for_json(metadata)
         with open(cache_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
+            json.dump(prepared_metadata, f, indent=2)
         logging.info(f"Saved metadata to cache for {model_name} (size: {file_size}) at {cache_path}")
     except Exception as e:
         logging.error(f"Error saving metadata to cache {cache_path}: {e}")
@@ -207,7 +246,7 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         # Ensure publisher is a string
         publisher = str(publisher_val) if publisher_val is not None else 'local'
 
-        architecture_val = get_scalar_metadata('general.architecture', 'unknown')
+        architecture_val = get_scalar_metadata(raw_metadata, 'general.architecture', 'unknown')
         # Ensure architecture is a string
         architecture = str(architecture_val) if architecture_val is not None else 'unknown'
 
@@ -216,7 +255,7 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
 
         # quantization: LlamaFileType(general.file_type).name (fallback to heuristic)
         quantization = "Unknown"
-        file_type_val = get_scalar_metadata('general.file_type') # Use the helper to get the raw value
+        file_type_val = get_scalar_metadata(raw_metadata, 'general.file_type') # Use the helper to get the raw value
 
         # --- Add debug logging for file_type_val ---
         logging.debug(f"Raw 'general.file_type' value: {file_type_val}, Type: {type(file_type_val)}")

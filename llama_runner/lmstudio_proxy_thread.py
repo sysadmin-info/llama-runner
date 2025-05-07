@@ -17,6 +17,7 @@ import uvicorn
 from PySide6.QtCore import QThread, Slot # Import QTimer for potential use
 
 from llama_runner import gguf_metadata # Import the new metadata module
+from llama_runner.config_loader import calculate_system_fingerprint
 
 # Configure logging (already done in main.py for configurable levels)
 # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -31,7 +32,8 @@ app = FastAPI()
 async def _get_lmstudio_models_handler(request: Request):
     """Handler for GET /api/v0/models"""
     # Access state from the request's app instance
-    models_config = request.app.state.models_config
+    # Access state from the request's app instance
+    all_models_config = request.app.state.all_models_config # Use all_models_config
     is_model_running_callback = request.app.state.is_model_running_callback
 
     if not gguf_metadata.GGUF_AVAILABLE:
@@ -39,7 +41,7 @@ async def _get_lmstudio_models_handler(request: Request):
 
     try:
         all_models_data = gguf_metadata.get_all_models_lmstudio_format(
-            models_config, is_model_running_callback
+            all_models_config, is_model_running_callback
         )
         return JSONResponse(content={
             "object": "list",
@@ -53,7 +55,8 @@ async def _get_lmstudio_models_handler(request: Request):
 async def _get_lmstudio_model_handler(model_id: str, request: Request):
     """Handler for GET /api/v0/models/{model_id}"""
     # Access state from the request's app instance
-    models_config = request.app.state.models_config
+    # Access state from the request's app instance
+    all_models_config = request.app.state.all_models_config # Use all_models_config
     is_model_running_callback = request.app.state.is_model_running_callback
 
     if not gguf_metadata.GGUF_AVAILABLE:
@@ -61,8 +64,9 @@ async def _get_lmstudio_model_handler(model_id: str, request: Request):
 
     try:
         # Find the model in the config by its LM Studio ID (which is the model_name from config)
+        # Find the model in the config by its LM Studio ID (which is the model_name from config)
         model_data = gguf_metadata.get_single_model_lmstudio_format(
-            model_id, models_config, is_model_running_callback
+            model_id, all_models_config, is_model_running_callback # Use all_models_config
         )
 
         if model_data:
@@ -83,61 +87,98 @@ async def _dynamic_route_v1_request_generator(request: Request, target_path: Opt
     This is an async generator function for streaming responses.
     """
     # Access state and callbacks from the request's app instance
-    models_config = request.app.state.models_config
-    is_model_running_callback = request.app.state.is_model_running_callback
+    all_models_config = request.app.state.all_models_config # Use all_models_config
+    runtimes_config = request.app.state.runtimes_config # Use runtimes_config
     get_runner_port_callback = request.app.state.get_runner_port_callback
     request_runner_start_callback = request.app.state.request_runner_start_callback
     # Access the proxy thread instance to get the futures dictionary
     proxy_thread: FastAPIProxyThread = request.app.state.proxy_thread_instance # We'll set this in run_async
 
-    # Extract the model name from the request body (common for chat/completions)
-    # This is a simplification; a more robust solution would inspect the path and body structure
-    # based on the specific endpoint (/v1/chat/completions, /v1/completions, etc.)
-    # For now, assume the model name is in the request JSON body under the 'model' key.
-    # Need to read the body without consuming it for the downstream request.
+    # Extract the model name from the request body
     try:
-        # Read body bytes first, then attempt to parse as JSON
         body_bytes = await request.body()
         body = {}
-        try:
-            if body_bytes:
+        if body_bytes:
+            try:
                 body = json.loads(body_bytes)
-        except json.JSONDecodeError:
-            logging.warning(f"Could not decode request body as JSON for {request.url.path}")
-            # For a generator, we need to yield an error message or handle it differently.
-            # Raising HTTPException here won't be caught by the standard handler for generators.
-            # Yielding an error message in SSE format is a common pattern.
-            yield b'data: {"error": "Invalid JSON request body."}\n\n'
+            except json.JSONDecodeError:
+                logging.warning(f"Could not decode request body as JSON for {request.url.path}")
+                yield b'data: {"error": "Invalid JSON request body."}\n\n'
+                return # Stop the generator
+
+        model_name_from_request = body.get("model") # This is the ID used by LM Studio (e.g., "vendor/model-name-gguf")
+        if not model_name_from_request:
+            logging.warning(f"Model name not found in request body for {request.url.path}")
+            yield b'data: {"error": "Model name not specified in request body."}\n\n'
             return # Stop the generator
-
-
-        model_name = body.get("model")
-        if not model_name:
-             # If model is not in body, try path parameters if applicable (less common for v1)
-             # Or yield an error if model is required but missing
-             logging.warning(f"Model name not found in request body for {request.url.path}")
-             yield b'data: {"error": "Model name not specified in request body."}\n\n'
-             return # Stop the generator
 
     except Exception as e:
         logging.error(f"Error reading request body or extracting model name: {e}\n{traceback.format_exc()}")
         yield f'data: {{"error": "Invalid request: {e}"}}\n\n'.encode('utf-8')
         return # Stop the generator
 
+    logging.debug(f"Intercepted request for model (ID from request): {model_name_from_request} at path: {request.url.path}")
+    logging.debug(f"Available models in all_models_config: {list(all_models_config.keys())}")
+    logging.debug(f"Available runtimes in runtimes_config: {list(runtimes_config.keys())}")
 
-    logging.debug(f"Intercepted request for model: {model_name} at path: {request.url.path}")
-    logging.debug(f"Available models in models_config: {list(models_config.keys())}")
-    logging.debug(f"Available models in app.state.models_metadata: {[model['id'] for model in app.state.models_metadata]}")
+    # LM Studio uses an ID format (e.g., "vendor/model-file.gguf") in requests.
+    # We need to map this ID back to our internal model name (the key in all_models_config).
+    # The gguf_metadata.get_model_name_to_id_mapping uses all_models_config.
+    id_to_internal_name_mapping = {v: k for k, v in gguf_metadata.get_model_name_to_id_mapping(all_models_config).items()}
+    internal_model_name = id_to_internal_name_mapping.get(model_name_from_request)
 
-    id_to_name_mapping = {v: k for k, v in gguf_metadata.get_model_name_to_id_mapping(models_config).items()}
-    model_name_in_config = id_to_name_mapping.get(model_name, model_name)
-    if model_name_in_config not in models_config:
-        logging.warning(f"Request for unknown model: {model_name}")
-        yield f"data: {{\"error\": \"Model '{model_name}' not found in configuration.\"}}\n\n".encode('utf-8')
-        return # Stop the generator
-    model_name = model_name_in_config
+    if not internal_model_name:
+        # Fallback: if the request model_name is already an internal name (should not happen for LM Studio proxy)
+        if model_name_from_request in all_models_config:
+            internal_model_name = model_name_from_request
+            logging.warning(f"Request model ID '{model_name_from_request}' matched an internal model name directly. This might indicate a misconfiguration or unexpected request format.")
+        else:
+            logging.warning(f"Request for unknown model ID: {model_name_from_request}. Could not map to an internal model name.")
+            yield f"data: {{\"error\": \"Model ID '{model_name_from_request}' not found in configuration mapping.\"}}\n\n".encode('utf-8')
+            return # Stop the generator
+    
+    logging.debug(f"Mapped request model ID '{model_name_from_request}' to internal model name '{internal_model_name}'")
 
-    # Check if the runner is already running
+    # Get the specific model's configuration details from all_models_config using the internal_model_name
+    model_config_details = all_models_config.get(internal_model_name)
+    runtime_name_for_model = model_config_details.get("llama_cpp_runtime") if model_config_details else None
+
+    if not runtime_name_for_model:
+        logging.warning(f"Runtime not defined for model '{internal_model_name}' (from request ID '{model_name_from_request}') in main configuration.")
+        yield f"data: {{\"error\": \"Runtime not configured for model '{internal_model_name}'.\"}}\n\n".encode('utf-8')
+        return
+
+    # Get the runtime's configuration from runtimes_config
+    runtime_details_from_config = runtimes_config.get(runtime_name_for_model)
+
+    if not runtime_details_from_config:
+        logging.warning(f"Configuration for runtime '{runtime_name_for_model}' (for model '{internal_model_name}') not found in runtimes configuration.")
+        yield f"data: {{\"error\": \"Configuration for runtime '{runtime_name_for_model}' not found.\"}}\n\n".encode('utf-8')
+        return
+
+    # Conditionally remove 'tools' and 'tool_choice' from the request body
+    if body_bytes and body: # Ensure body was successfully parsed
+        if runtime_details_from_config.get("supports_tools") is False:
+            tools_present_in_request = "tools" in body
+            tool_choice_present_in_request = "tool_choice" in body
+
+            if tools_present_in_request:
+                body.pop("tools")
+            if tool_choice_present_in_request:
+                body.pop("tool_choice")
+
+            if tools_present_in_request or tool_choice_present_in_request:
+                logging.info(
+                    f"Model '{internal_model_name}' (request ID: '{model_name_from_request}', runtime: '{runtime_name_for_model}') "
+                    f"has supports_tools=False. Removed 'tools' and/or 'tool_choice' from request to {request.url.path}."
+                )
+                # Re-encode the modified body to body_bytes as it's used later for forwarding
+                body_bytes = json.dumps(body).encode('utf-8')
+
+    # Check if the runner is already running using the internal_model_name
+    # Note: The 'model_name' variable used from here onwards for runner management
+    # should be the 'internal_model_name'.
+    model_name = internal_model_name # Ensure 'model_name' refers to the internal name for subsequent logic
     port = get_runner_port_callback(model_name)
 
     if port is None:
@@ -220,16 +261,64 @@ async def _dynamic_route_v1_request_generator(request: Request, target_path: Opt
                 # This requires inspecting headers like 'content-type'
                 content_type = proxy_response.headers.get('content-type', '').lower()
                 if 'text/event-stream' in content_type:
-                     logging.debug(f"Forwarding streaming response from {target_url}")
-                     # Yield chunks directly from the httpx stream within this generator
-                     async for chunk in proxy_response.aiter_bytes():
-                        yield chunk # Yield each chunk as it arrives
-                else:
-                     logging.debug(f"Forwarding non-streaming response from {target_url}")
-                     # For non-streaming responses, read the body and yield it as a single chunk
-                     response_body = await proxy_response.aread() # Read the entire body asynchronously
-                     yield response_body # Yield the entire body as one chunk
+                    logging.debug(f"Forwarding streaming response from {target_url}")
+                    # Load config and calculate fingerprint once for the stream
+                    config = request.app.state.all_models_config
+                    model_config = config.get(model_name, {})
+                    system_fingerprint = calculate_system_fingerprint(model_config)
 
+                    # Process and yield chunks, adding fingerprint if needed
+                    async for chunk in proxy_response.aiter_bytes():
+                        try:
+                            chunk_str = chunk.decode('utf-8').strip()
+                            if chunk_str.startswith('data: '):
+                                json_payload_str = chunk_str[len('data: '):].strip()
+                                if json_payload_str == '[DONE]':
+                                    yield chunk # Pass through the DONE signal
+                                    continue
+                                try:
+                                    data_json = json.loads(json_payload_str)
+                                    if 'system_fingerprint' not in data_json:
+                                        data_json['system_fingerprint'] = system_fingerprint
+                                        modified_chunk_str = f'data: {json.dumps(data_json)}\n\n'
+                                        yield modified_chunk_str.encode('utf-8')
+                                    else:
+                                        yield chunk # Yield original chunk if fingerprint exists
+                                except json.JSONDecodeError:
+                                    logging.warning(f"Could not decode JSON from streaming chunk: {json_payload_str}")
+                                    yield chunk # Yield original chunk if not valid JSON
+                            else:
+                                # Yield non-data lines (e.g., comments, empty lines) as is
+                                yield chunk
+                        except Exception as e:
+                            logging.error(f"Error processing streaming chunk: {e}\n{traceback.format_exc()}")
+                            yield chunk # Yield original chunk in case of processing error
+                else:
+                    logging.debug(f"Forwarding non-streaming response from {target_url}")
+                    # For non-streaming responses, read the body and yield it as a single chunk
+                    response_body = await proxy_response.aread() # Read the entire body asynchronously
+                    try:
+                        response_json = json.loads(response_body.decode('utf-8'))
+                        # Check if 'system_fingerprint' is missing
+                        if 'system_fingerprint' not in response_json:
+                            # Load config and calculate fingerprint
+                            config = request.app.state.all_models_config
+                            model_config = config.get(model_name, {})
+                            system_fingerprint = calculate_system_fingerprint(model_config)
+                            # Add 'system_fingerprint' to the response JSON
+                            response_json['system_fingerprint'] = system_fingerprint
+                            # Re-encode the modified JSON
+                            modified_response_body = json.dumps(response_json).encode('utf-8')
+                        else:
+                            modified_response_body = response_body
+                    except json.JSONDecodeError:
+                        logging.warning(f"Could not decode JSON from runner response: {response_body.decode('utf-8')}")
+                        modified_response_body = response_body # Use original if JSON decode fails
+
+                    if proxy_response.status_code != 200:
+                        # Handle non-200 responses
+                        logging.error(f"Error response from {target_url}: {proxy_response.status_code} - {modified_response_body.decode('utf-8')}")
+                    yield modified_response_body # Yield the modified (or original) body as one chunk
 
         except httpx.RequestError as e:
             logging.error(f"Error forwarding request to runner {model_name} on port {port}: {e}\n{traceback.format_exc()}")
@@ -345,13 +434,15 @@ class FastAPIProxyThread(QThread): # Renamed class
     # error = Signal(str)
 
     def __init__(self,
-                 models_config: Dict[str, Dict[str, Any]],
+                 all_models_config: Dict[str, Dict[str, Any]], # Renamed models_config
+                 runtimes_config: Dict[str, Dict[str, Any]], # Added runtimes_config
                  is_model_running_callback: Callable[[str], bool],
                  get_runner_port_callback: Callable[[str], Optional[int]],
                  request_runner_start_callback: Callable[[str], asyncio.Future], # Callback now returns Future
                  api_key: str = None):
         super().__init__()
-        self.models_config = models_config
+        self.all_models_config = all_models_config # Store all_models_config
+        self.runtimes_config = runtimes_config # Store runtimes_config
         self.is_model_running_callback = is_model_running_callback
         self.get_runner_port_callback = get_runner_port_callback
         self.request_runner_start_callback = request_runner_start_callback # Store the callback
@@ -458,13 +549,15 @@ class FastAPIProxyThread(QThread): # Renamed class
             # 4. Start the proxy embedded via Uvicorn
             # Set state on the global app instance BEFORE creating the server
             # This state will be accessible by the standalone handler functions
-            app.state.models_config = self.models_config
+            app.state.all_models_config = self.all_models_config # Pass all_models_config
+            app.state.runtimes_config = self.runtimes_config # Pass runtimes_config
             app.state.is_model_running_callback = self.is_model_running_callback
             app.state.get_runner_port_callback = self.get_runner_port_callback # Pass the new callback
             app.state.request_runner_start_callback = self.request_runner_start_callback # Pass the new callback
             # Extract metadata for all models and store it in app.state.models_metadata
+            # Note: get_all_models_lmstudio_format expects the main models config (all_models_config)
             app.state.models_metadata = gguf_metadata.get_all_models_lmstudio_format(
-                self.models_config, self.is_model_running_callback
+                self.all_models_config, self.is_model_running_callback
             )
 
             # Use port 1234 as required
