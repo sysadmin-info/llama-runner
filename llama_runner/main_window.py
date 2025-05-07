@@ -389,19 +389,28 @@ class MainWindow(QWidget):
         # Style the model list
         self.model_list_widget.setStyleSheet("""
             QListWidget {
-                border: 0;
+                border: none;
+                outline: none;
                 border-radius: 5px;
                 padding: 5px;
                 background-color: #f0f0f0;
+                font-size: 12pt;
             }
             QListWidget::item {
                 padding: 8px; /* Add padding to list items */
-                font-size: 12pt; /* Increase font size */
                 margin-bottom: 4px; /* Add space between items */
+                background-color: #f0f0f0; /* Default item color */
+                border: none;
+                outline: none;   
             }
             QListWidget::item:selected {
                 background-color: #a0c0f0; /* Highlight color */
                 color: #333333;
+                border: none;
+                outline: none;
+            }
+            QListWidget::item:selected:focus {
+                show-decoration-selected: false;                                 
             }
         """)
         self.layout.addWidget(self.model_list_widget)
