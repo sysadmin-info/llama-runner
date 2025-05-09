@@ -91,6 +91,8 @@ async def _dynamic_route_v1_request_generator(request: Request, target_path: Opt
     runtimes_config = request.app.state.runtimes_config # Use runtimes_config
     get_runner_port_callback = request.app.state.get_runner_port_callback
     request_runner_start_callback = request.app.state.request_runner_start_callback
+    prompt_logging_enabled = request.app.state.prompt_logging_enabled # Access prompt logging flag
+    prompts_logger = request.app.state.prompts_logger # Access prompts logger instance
     # Access the proxy thread instance to get the futures dictionary
     proxy_thread: FastAPIProxyThread = request.app.state.proxy_thread_instance # We'll set this in run_async
 
@@ -105,6 +107,29 @@ async def _dynamic_route_v1_request_generator(request: Request, target_path: Opt
                 logging.warning(f"Could not decode request body as JSON for {request.url.path}")
                 yield b'data: {"error": "Invalid JSON request body."}\n\n'
                 return # Stop the generator
+
+        model_name_from_request = body.get("model") # This is the ID used by LM Studio (e.g., "vendor/model-name-gguf")
+        if not model_name_from_request:
+            logging.warning(f"Model name not found in request body for {request.url.path}")
+            yield b'data: {"error": "Model name not specified in request body."}\n\n'
+            return # Stop the generator
+
+        # Log the incoming request if prompt logging is enabled
+        if prompt_logging_enabled:
+            try:
+                # Log the request body as a JSON string
+                prompts_logger.info(f"Request to {request.url.path} for model '{model_name_from_request}': {json.dumps(body)}")
+            except Exception as log_e:
+                logging.error(f"Error logging request body for {request.url.path}: {log_e}")
+
+    except Exception as e:
+        logging.error(f"Error reading request body or extracting model name: {e}\n{traceback.format_exc()}")
+        yield f'data: {{"error": "Invalid request: {e}"}}\n\n'.encode('utf-8')
+        return # Stop the generator
+
+    logging.debug(f"Intercepted request for model (ID from request): {model_name_from_request} at path: {request.url.path}")
+    logging.debug(f"Available models in all_models_config: {list(all_models_config.keys())}")
+    logging.debug(f"Available runtimes in runtimes_config: {list(runtimes_config.keys())}")
 
         model_name_from_request = body.get("model") # This is the ID used by LM Studio (e.g., "vendor/model-name-gguf")
         if not model_name_from_request:
@@ -241,6 +266,7 @@ async def _dynamic_route_v1_request_generator(request: Request, target_path: Opt
 
     # Use httpx to forward the request and yield chunks directly
     async with httpx.AsyncClient() as client:
+        response_chunks = [] # Buffer for response chunks
         try:
             # Reconstruct headers, removing host and potentially others that shouldn't be forwarded
             headers = dict(request.headers)
@@ -260,7 +286,9 @@ async def _dynamic_route_v1_request_generator(request: Request, target_path: Opt
                 # Check if the response is streaming (e.g., Server-Sent Events)
                 # This requires inspecting headers like 'content-type'
                 content_type = proxy_response.headers.get('content-type', '').lower()
-                if 'text/event-stream' in content_type:
+                is_streaming = 'text/event-stream' in content_type
+
+                if is_streaming:
                     logging.debug(f"Forwarding streaming response from {target_url}")
                     # Load config and calculate fingerprint once for the stream
                     config = request.app.state.all_models_config
@@ -269,6 +297,8 @@ async def _dynamic_route_v1_request_generator(request: Request, target_path: Opt
 
                     # Process and yield chunks, adding fingerprint if needed
                     async for chunk in proxy_response.aiter_bytes():
+                        if prompt_logging_enabled:
+                             response_chunks.append(chunk) # Buffer chunk for logging
                         try:
                             chunk_str = chunk.decode('utf-8').strip()
                             if chunk_str.startswith('data: '):
@@ -297,6 +327,8 @@ async def _dynamic_route_v1_request_generator(request: Request, target_path: Opt
                     logging.debug(f"Forwarding non-streaming response from {target_url}")
                     # For non-streaming responses, read the body and yield it as a single chunk
                     response_body = await proxy_response.aread() # Read the entire body asynchronously
+                    if prompt_logging_enabled:
+                         response_chunks.append(response_body) # Buffer the full body
                     try:
                         response_json = json.loads(response_body.decode('utf-8'))
                         # Check if 'system_fingerprint' is missing
@@ -322,6 +354,9 @@ async def _dynamic_route_v1_request_generator(request: Request, target_path: Opt
 
         except httpx.RequestError as e:
             logging.error(f"Error forwarding request to runner {model_name} on port {port}: {e}\n{traceback.format_exc()}")
+            # Log the error response if prompt logging is enabled
+            if prompt_logging_enabled:
+                 prompts_logger.error(f"Error response from {target_url} for model '{model_name}': {e}")
             # In a generator, we can't raise HTTPException directly.
             # We could yield an error message or re-raise after the generator is consumed.
             # Yielding an error message in SSE format is a common pattern.
@@ -331,9 +366,28 @@ async def _dynamic_route_v1_request_generator(request: Request, target_path: Opt
 
         except Exception as e:
             logging.error(f"Unexpected error during request forwarding for {model_name}: {e}\n{traceback.format_exc()}")
+            # Log the unexpected error if prompt logging is enabled
+            if prompt_logging_enabled:
+                 prompts_logger.error(f"Unexpected error processing request for model '{model_name}': {e}")
             # Handle unexpected errors similarly
             yield f'data: {{"error": "Internal error processing request for model \'{model_name}\': {e}"}}\n\n'.encode('utf-8')
             # No return here, let the generator finish naturally
+
+        finally:
+            # Log the complete response if prompt logging is enabled and response_chunks were collected
+            if prompt_logging_enabled and response_chunks:
+                 try:
+                     full_response_bytes = b''.join(response_chunks)
+                     # Attempt to decode and log as JSON if possible, otherwise log raw bytes
+                     try:
+                         full_response_json = json.loads(full_response_bytes.decode('utf-8'))
+                         prompts_logger.info(f"Response from {target_url} for model '{model_name}': {json.dumps(full_response_json)}")
+                     except json.JSONDecodeError:
+                         # If not JSON, log the raw string or a truncated version
+                         response_str = full_response_bytes.decode('utf-8', errors='replace')
+                         prompts_logger.info(f"Raw response from {target_url} for model '{model_name}': {response_str[:500]}...") # Log first 500 chars
+                 except Exception as log_e:
+                     logging.error(f"Error logging response body for {request.url.path}: {log_e}")
 
 
 # --- End handler for /v1/* requests ---
@@ -469,6 +523,8 @@ class FastAPIProxyThread(QThread): # Renamed class
                  is_model_running_callback: Callable[[str], bool],
                  get_runner_port_callback: Callable[[str], Optional[int]],
                  request_runner_start_callback: Callable[[str], asyncio.Future], # Callback now returns Future
+                 prompt_logging_enabled: bool, # Add prompt logging flag
+                 prompts_logger: logging.Logger, # Add prompts logger instance
                  api_key: str = None):
         super().__init__()
         self.all_models_config = all_models_config # Store all_models_config
@@ -476,6 +532,8 @@ class FastAPIProxyThread(QThread): # Renamed class
         self.is_model_running_callback = is_model_running_callback
         self.get_runner_port_callback = get_runner_port_callback
         self.request_runner_start_callback = request_runner_start_callback # Store the callback
+        self.prompt_logging_enabled = prompt_logging_enabled # Store the flag
+        self.prompts_logger = prompts_logger # Store the logger instance
         self.api_key = api_key
         self.is_running = False
         self._uvicorn_server = None
@@ -554,6 +612,10 @@ class FastAPIProxyThread(QThread): # Renamed class
             #          logging.error(f"Error cleaning up temporary LiteLLM config file {self._temp_config_path}: {e}")
             # self._temp_config_path = None # Clear the path
 
+            # Log proxy stop using the prompts logger if enabled
+            if self.prompt_logging_enabled:
+                 self.prompts_logger.info("FastAPI Proxy thread stopping.")
+
             # --- Clean up the proxy thread instance from app state ---
             if hasattr(app.state, 'proxy_thread_instance'):
                  del app.state.proxy_thread_instance
@@ -584,6 +646,8 @@ class FastAPIProxyThread(QThread): # Renamed class
             app.state.is_model_running_callback = self.is_model_running_callback
             app.state.get_runner_port_callback = self.get_runner_port_callback # Pass the new callback
             app.state.request_runner_start_callback = self.request_runner_start_callback # Pass the new callback
+            app.state.prompt_logging_enabled = self.prompt_logging_enabled # Set prompt logging flag on state
+            app.state.prompts_logger = self.prompts_logger # Set prompts logger on state
             # Extract metadata for all models and store it in app.state.models_metadata
             # Note: get_all_models_lmstudio_format expects the main models config (all_models_config)
             app.state.models_metadata = gguf_metadata.get_all_models_lmstudio_format(
@@ -597,6 +661,9 @@ class FastAPIProxyThread(QThread): # Renamed class
             print("FastAPI Proxy listening on http://127.0.0.1:1234")
             logging.info("FastAPI Proxy listening on http://127.0.0.1:1234")
 
+            # Log proxy start using the prompts logger if enabled
+            if self.prompt_logging_enabled:
+                 self.prompts_logger.info("FastAPI Proxy thread started and listening on http://127.0.0.1:1234")
 
             # This call is blocking until the server stops
             await self._uvicorn_server.serve()

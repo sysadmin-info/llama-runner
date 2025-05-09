@@ -38,6 +38,8 @@ async def _dynamic_route_runner_request_generator(request: Request, target_path:
     runtimes_config = request.app.state.runtimes_config # Use runtimes_config
     get_runner_port_callback = request.app.state.get_runner_port_callback
     request_runner_start_callback = request.app.state.request_runner_start_callback
+    prompt_logging_enabled = request.app.state.prompt_logging_enabled # Access prompt logging flag
+    prompts_logger = request.app.state.prompts_logger # Access prompts logger instance
     # Access the proxy thread instance to get the futures dictionary
     proxy_thread: OllamaProxyThread = request.app.state.proxy_thread_instance
 
@@ -46,6 +48,14 @@ async def _dynamic_route_runner_request_generator(request: Request, target_path:
         logging.warning(f"Model name not found in request body for {request.url.path}")
         yield b'data: {"error": "Model name not specified in request body."}\n\n'
         return # Stop the generator
+
+    # Log the incoming request if prompt logging is enabled
+    if prompt_logging_enabled:
+        try:
+            # Log the request body as a JSON string
+            prompts_logger.info(f"Request to {request.url.path} for model '{model_name_from_request}': {json.dumps(request_body)}")
+        except Exception as log_e:
+            logging.error(f"Error logging request body for {request.url.path}: {log_e}")
 
     logging.debug(f"Intercepted request for model: {model_name_from_request} at path: {request.url.path}")
     logging.debug(f"Available models in all_models_config: {list(all_models_config.keys())}")
@@ -154,6 +164,7 @@ async def _dynamic_route_runner_request_generator(request: Request, target_path:
 
     # Use httpx to forward the request and yield chunks directly
     async with httpx.AsyncClient() as client:
+        response_chunks = [] # Buffer for response chunks
         try:
             # Reconstruct headers, removing host and potentially others that shouldn't be forwarded
             headers = dict(request.headers)
@@ -172,24 +183,52 @@ async def _dynamic_route_runner_request_generator(request: Request, target_path:
 
                 # Check if the response is streaming (e.g., Server-Sent Events)
                 content_type = proxy_response.headers.get('content-type', '').lower()
-                if 'text/event-stream' in content_type:
+                is_streaming = 'text/event-stream' in content_type
+
+                if is_streaming:
                     logging.debug(f"Forwarding streaming response from {target_url}")
                     # Yield chunks directly from the httpx stream within this generator
                     async for chunk in proxy_response.aiter_bytes():
+                        if prompt_logging_enabled:
+                             response_chunks.append(chunk) # Buffer chunk for logging
                         yield chunk # Yield each chunk as it arrives
                 else:
                     logging.debug(f"Forwarding non-streaming response from {target_url}")
                     # For non-streaming responses, read the body and yield it as a single chunk
                     response_body = await proxy_response.aread() # Read the entire body asynchronously
+                    if prompt_logging_enabled:
+                         response_chunks.append(response_body) # Buffer the full body
                     yield response_body # Yield the original body as one chunk
 
         except httpx.RequestError as e:
             logging.error(f"Error forwarding request to runner {model_name_from_request} on port {port}: {e}\n{traceback.format_exc()}")
+            # Log the error response if prompt logging is enabled
+            if prompt_logging_enabled:
+                 prompts_logger.error(f"Error response from {target_url} for model '{model_name_from_request}': {e}")
             yield f'data: {{"error": "Error communicating with runner for model \'{model_name_from_request}\': {e}"}}\n\n'.encode('utf-8')
 
         except Exception as e:
             logging.error(f"Unexpected error during request forwarding for {model_name_from_request}: {e}\n{traceback.format_exc()}")
+            # Log the unexpected error if prompt logging is enabled
+            if prompt_logging_enabled:
+                 prompts_logger.error(f"Unexpected error processing request for model '{model_name_from_request}': {e}")
             yield f'data: {{"error": "Internal error processing request for model \'{model_name_from_request}\': {e}"}}\n\n'.encode('utf-8')
+
+        finally:
+            # Log the complete response if prompt logging is enabled and no major error occurred during forwarding
+            if prompt_logging_enabled and response_chunks:
+                 try:
+                     full_response_bytes = b''.join(response_chunks)
+                     # Attempt to decode and log as JSON if possible, otherwise log raw bytes
+                     try:
+                         full_response_json = json.loads(full_response_bytes.decode('utf-8'))
+                         prompts_logger.info(f"Response from {target_url} for model '{model_name_from_request}': {json.dumps(full_response_json)}")
+                     except json.JSONDecodeError:
+                         # If not JSON, log the raw string or a truncated version
+                         response_str = full_response_bytes.decode('utf-8', errors='replace')
+                         prompts_logger.info(f"Raw response from {target_url} for model '{model_name_from_request}': {response_str[:500]}...") # Log first 500 chars
+                 except Exception as log_e:
+                     logging.error(f"Error logging response body for {request.url.path}: {log_e}")
 
 # --- End handler for dynamic routing ---
 
@@ -551,13 +590,17 @@ class OllamaProxyThread(QThread):
                  runtimes_config: Dict[str, Dict[str, Any]], # Renamed models_config to runtimes_config
                  is_model_running_callback: Callable[[str], bool],
                  get_runner_port_callback: Callable[[str], Optional[int]],
-                 request_runner_start_callback: Callable[[str], asyncio.Future]):
+                 request_runner_start_callback: Callable[[str], asyncio.Future],
+                 prompt_logging_enabled: bool, # Add prompt logging flag
+                 prompts_logger: logging.Logger): # Add prompts logger instance
         super().__init__()
         self.all_models_config = all_models_config # Store all_models_config
         self.runtimes_config = runtimes_config # Store runtimes_config
         self.is_model_running_callback = is_model_running_callback
         self.get_runner_port_callback = get_runner_port_callback
         self.request_runner_start_callback = request_runner_start_callback
+        self.prompt_logging_enabled = prompt_logging_enabled # Store the flag
+        self.prompts_logger = prompts_logger # Store the logger instance
         self.is_running = False
         self._uvicorn_server = None
 
@@ -619,6 +662,10 @@ class OllamaProxyThread(QThread):
         finally:
             self.is_running = False
 
+            # Log proxy stop using the prompts logger if enabled
+            if self.prompt_logging_enabled:
+                 self.prompts_logger.info("Ollama Proxy thread stopping.")
+
             # --- Clean up the proxy thread instance from app state ---
             if hasattr(app.state, 'proxy_thread_instance'):
                  del app.state.proxy_thread_instance
@@ -644,6 +691,8 @@ class OllamaProxyThread(QThread):
             app.state.is_model_running_callback = self.is_model_running_callback
             app.state.get_runner_port_callback = self.get_runner_port_callback
             app.state.request_runner_start_callback = self.request_runner_start_callback
+            app.state.prompt_logging_enabled = self.prompt_logging_enabled # Set prompt logging flag on state
+            app.state.prompts_logger = self.prompts_logger # Set prompts logger on state
 
             # Use port 11434 as required for Ollama emulation
             uvicorn_config = uvicorn.Config(app, host="127.0.0.1", port=11434, reload=False)
@@ -651,6 +700,11 @@ class OllamaProxyThread(QThread):
 
             print("Ollama Proxy listening on http://127.0.0.1:11434")
             logging.info("Ollama Proxy listening on http://127.0.0.1:11434")
+
+            # Log proxy start using the prompts logger if enabled
+            if self.prompt_logging_enabled:
+                 self.prompts_logger.info("Ollama Proxy thread started and listening on http://127.0.0.1:11434")
+
 
             # This call is blocking until the server stops
             await self._uvicorn_server.serve()
