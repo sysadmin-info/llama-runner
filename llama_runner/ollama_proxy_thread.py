@@ -646,11 +646,11 @@ class OllamaProxyThread(QThread):
             app.state.request_runner_start_callback = self.request_runner_start_callback
 
             # Use port 11434 as required for Ollama emulation
-            uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=11434, reload=False)
+            uvicorn_config = uvicorn.Config(app, host="127.0.0.1", port=11434, reload=False)
             self._uvicorn_server = uvicorn.Server(uvicorn_config)
 
-            print("Ollama Proxy listening on http://0.0.0.0:11434")
-            logging.info("Ollama Proxy listening on http://0.0.0.0:11434")
+            print("Ollama Proxy listening on http://127.0.0.1:11434")
+            logging.info("Ollama Proxy listening on http://127.0.0.1:11434")
 
             # This call is blocking until the server stops
             await self._uvicorn_server.serve()

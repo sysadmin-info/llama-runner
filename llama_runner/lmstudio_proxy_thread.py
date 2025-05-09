@@ -561,11 +561,11 @@ class FastAPIProxyThread(QThread): # Renamed class
             )
 
             # Use port 1234 as required
-            uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=1234, reload=False)
+            uvicorn_config = uvicorn.Config(app, host="127.0.0.1", port=1234, reload=False)
             self._uvicorn_server = uvicorn.Server(uvicorn_config)
 
-            print("FastAPI Proxy listening on http://0.0.0.0:1234")
-            logging.info("FastAPI Proxy listening on http://0.0.0.0:1234")
+            print("FastAPI Proxy listening on http://127.0.0.1:1234")
+            logging.info("FastAPI Proxy listening on http://127.0.0.1:1234")
 
 
             # This call is blocking until the server stops
