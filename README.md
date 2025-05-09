@@ -20,7 +20,7 @@ $ python main.py
 {
   "llama-runtimes": {
     "default": {
-      "runtime": "llama-server"vim 
+      "runtime": "llama-server"
     },
     "ik_llama": {
       "runtime": "/devel/tools/ik_llama.cpp/build/bin/llama-server",
