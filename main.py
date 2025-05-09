@@ -122,7 +122,8 @@ def main():
     app.setWindowIcon(QIcon('app_icon.png'))
 
     # Create the main window instance
-    window = MainWindow()
+    # Pass the prompt logging state to the MainWindow
+    window = MainWindow(prompt_logging_enabled=prompt_logging_enabled)
 
     # Show the main window
     window.show()
