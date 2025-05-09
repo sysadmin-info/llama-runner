@@ -2,6 +2,7 @@ import sys
 import logging # Import logging
 import argparse # Import argparse
 import os # Import os
+from datetime import datetime # Import datetime
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon # Import QIcon
 
@@ -24,6 +25,11 @@ def main():
         default="INFO", # Default to INFO
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Set the minimum logging level for console output (DEBUG, INFO, WARNING, ERROR, CRITICAL)"
+    )
+    parser.add_argument(
+        "--log-prompts",
+        action="store_true", # Store as boolean flag
+        help="Enable logging of prompts (requests and responses) to a dedicated file."
     )
     args = parser.parse_args()
 
@@ -72,19 +78,41 @@ def main():
     root_logger.addHandler(console_handler)
 
     # Create file handler for app.log
-    log_file_path = os.path.join(CONFIG_DIR, "app.log")
+    app_log_file_path = os.path.join(CONFIG_DIR, "app.log")
     try:
-        file_handler = logging.FileHandler(log_file_path)
+        app_file_handler = logging.FileHandler(app_log_file_path)
         # Set file level to DEBUG to capture all messages (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter)
-        root_logger.addHandler(file_handler)
-        logging.info(f"File logging enabled. Log file path: {log_file_path}")
+        app_file_handler.setLevel(logging.DEBUG)
+        app_file_handler.setFormatter(formatter)
+        root_logger.addHandler(app_file_handler)
+        logging.info(f"App file logging enabled. Log file path: {app_log_file_path}")
     except Exception as e:
-        logging.error(f"Failed to create file handler for {log_file_path}: {e}")
+        logging.error(f"Failed to create app file handler for {app_log_file_path}: {e}")
 
+    # Create a dedicated logger for prompts
+    prompts_logger = logging.getLogger("prompts")
+    prompts_logger.setLevel(logging.DEBUG) # Set level to DEBUG to capture all prompt messages
+
+    # If --log-prompts is enabled, add a file handler for prompts
+    if args.log_prompts:
+        prompt_log_filename = f"prompts-{datetime.now().strftime('%Y%m%d')}.log"
+        prompt_log_file_path = os.path.join(CONFIG_DIR, prompt_log_filename)
+        try:
+            prompt_file_handler = logging.FileHandler(prompt_log_file_path)
+            # Use the same formatter, or a different one if preferred
+            prompt_file_handler.setFormatter(formatter)
+            # Set level for prompt file handler (e.g., INFO or DEBUG)
+            prompt_file_handler.setLevel(logging.INFO) # Log INFO and above for prompts
+            prompts_logger.addHandler(prompt_file_handler)
+            logging.info(f"Prompt logging enabled. Log file path: {prompt_log_file_path}")
+        except Exception as e:
+            logging.error(f"Failed to create prompt file handler for {prompt_log_file_path}: {e}")
+
+    # Store the prompt logging state to be passed to proxy threads
+    prompt_logging_enabled = args.log_prompts
 
     logging.info(f"Console logging level set to {args.log_level.upper()}")
+    logging.info(f"Prompt logging is {'enabled' if prompt_logging_enabled else 'disabled'}")
 
 
     # Create the Qt application instance

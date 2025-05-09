@@ -339,10 +339,11 @@ class MainWindow(QWidget):
     # This signal is emitted by MainWindow, connected to the proxy thread
     runner_stopped_for_proxy = Signal(str)
 
-    def __init__(self):
+    def __init__(self, prompt_logging_enabled: bool = False):
         super().__init__()
 
         self.setWindowTitle("Llama Runner")
+        self.prompt_logging_enabled = prompt_logging_enabled # Store the flag
         self.resize(800, 600)
 
         self.config = load_config()
@@ -468,6 +469,9 @@ class MainWindow(QWidget):
         # --- Start the Ollama Proxy automatically ---
         self.start_ollama_proxy() # Add method call to start Ollama proxy
         # --- End automatic proxy start ---
+
+        # Get the prompts logger instance
+        self.prompts_logger = logging.getLogger("prompts")
 
 
     def closeEvent(self, event):
@@ -737,6 +741,8 @@ class MainWindow(QWidget):
             is_model_running_callback=self.is_llama_runner_running, # Pass the callback method
             get_runner_port_callback=self.get_runner_port, # Pass the callback method
             request_runner_start_callback=self.request_runner_start, # Pass the callback method
+            prompt_logging_enabled=self.prompt_logging_enabled, # Pass the flag
+            prompts_logger=self.prompts_logger, # Pass the logger instance
             # api_key is no longer passed if not used by our FastAPI app
             # api_key=proxy_api_key,
         )
@@ -773,6 +779,8 @@ class MainWindow(QWidget):
             is_model_running_callback=self.is_llama_runner_running, # Pass the callback method
             get_runner_port_callback=self.get_runner_port, # Pass the callback method
             request_runner_start_callback=self.request_runner_start, # Pass the callback method
+            prompt_logging_enabled=self.prompt_logging_enabled, # Pass the flag
+            prompts_logger=self.prompts_logger, # Pass the logger instance
         )
         # Connect signals from the proxy thread if needed (e.g., started, stopped, error)
         # self.ollama_proxy_thread.started.connect(self.on_ollama_proxy_started)
