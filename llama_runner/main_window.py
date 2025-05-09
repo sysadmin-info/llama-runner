@@ -470,9 +470,6 @@ class MainWindow(QWidget):
         self.start_ollama_proxy() # Add method call to start Ollama proxy
         # --- End automatic proxy start ---
 
-        # Get the prompts logger instance
-        self.prompts_logger = logging.getLogger("prompts")
-
 
     def closeEvent(self, event):
         """
