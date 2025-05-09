@@ -131,17 +131,6 @@ async def _dynamic_route_v1_request_generator(request: Request, target_path: Opt
     logging.debug(f"Available models in all_models_config: {list(all_models_config.keys())}")
     logging.debug(f"Available runtimes in runtimes_config: {list(runtimes_config.keys())}")
 
-        model_name_from_request = body.get("model") # This is the ID used by LM Studio (e.g., "vendor/model-name-gguf")
-        if not model_name_from_request:
-            logging.warning(f"Model name not found in request body for {request.url.path}")
-            yield b'data: {"error": "Model name not specified in request body."}\n\n'
-            return # Stop the generator
-
-    except Exception as e:
-        logging.error(f"Error reading request body or extracting model name: {e}\n{traceback.format_exc()}")
-        yield f'data: {{"error": "Invalid request: {e}"}}\n\n'.encode('utf-8')
-        return # Stop the generator
-
     logging.debug(f"Intercepted request for model (ID from request): {model_name_from_request} at path: {request.url.path}")
     logging.debug(f"Available models in all_models_config: {list(all_models_config.keys())}")
     logging.debug(f"Available runtimes in runtimes_config: {list(runtimes_config.keys())}")
