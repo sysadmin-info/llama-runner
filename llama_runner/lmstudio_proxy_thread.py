@@ -365,6 +365,35 @@ async def _proxy_v0_completions(request: Request):
 # --- End handlers for /api/v0/* proxying ---
 
 
+# --- Handler for /v1/models endpoint (OpenAI compatible) ---
+@app.get("/v1/models")
+async def _list_openai_models_handler(request: Request):
+    """Handler for GET /v1/models, returns a simplified OpenAI-compatible list."""
+    try:
+        all_models_config = request.app.state.all_models_config
+        # Get the mapping from internal name to LM Studio ID
+        id_mapping = gguf_metadata.get_model_name_to_id_mapping(all_models_config)
+
+        # Create the list of models in OpenAI format
+        models_list = []
+        for lmstudio_id in id_mapping.values():
+            models_list.append({
+                "id": lmstudio_id,
+                "object": "model",
+                "owned_by": "organization_owner" # Standard value for local models
+            })
+
+        return JSONResponse(content={
+            "object": "list",
+            "data": models_list
+        })
+    except Exception as e:
+        logging.error(f"Error handling /v1/models: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal Server Error retrieving models list")
+
+# --- End handler for /v1/models ---
+
+
 # --- Add routes for /v1/* endpoints to be intercepted ---
 # Use a path parameter to capture the rest of the path after /v1
 # This allows intercepting /v1/chat/completions, /v1/completions, etc.
@@ -389,6 +418,7 @@ async def _proxy_v0_completions(request: Request):
 # The handler will extract the model name from the request body
 # Check if our dynamic handlers are already added to avoid duplicates on reload/restart
 # This check is fragile, a better approach might be needed if routes are added dynamically elsewhere
+# Note: /v1/models is handled separately above.
 dynamic_v1_paths = ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"]
 # Check if the *handler function itself* is already associated with the path
 # This is a more robust check than just checking the path string
