@@ -357,6 +357,9 @@ class MainWindow(QWidget):
              logging.warning(f"Invalid 'concurrentRunners' value in config: {self.concurrent_runners_limit}. Defaulting to 1.")
              self.concurrent_runners_limit = 1
 
+        # Get the prompts logger instance
+        self.prompts_logger = logging.getLogger("prompts")
+
         # Initialize metadata cache and load metadata for all models
         gguf_metadata.ensure_cache_dir_exists()
         self.model_metadata_cache = {}
