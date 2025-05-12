@@ -367,7 +367,7 @@ class MainWindow(QWidget):
              model_path = model_config.get("model_path")
              if model_path:
                  # Load/extract metadata on startup. State is 'not-loaded' initially.
-                 metadata = gguf_metadata.get_model_lmstudio_format(model_name, model_path, is_running=False)
+                 metadata = gguf_metadata.get_model_lmstudio_format(model_name, model_path, model_config, False)
                  if metadata:
                      self.model_metadata_cache[model_name] = metadata
              else:
