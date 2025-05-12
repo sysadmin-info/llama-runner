@@ -131,7 +131,7 @@ def save_metadata_to_cache(model_name: str, file_size: int, metadata: Dict[str, 
     except Exception as e:
         logging.error(f"Error saving metadata to cache {cache_path}: {e}")
 
-def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
+def extract_gguf_metadata(model_path: str, model_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Extracts relevant metadata from a GGUF file."""
     # --- Add debug logging at the start of the function ---
     logging.debug(f"Attempting to extract GGUF metadata from: {model_path}")
@@ -218,10 +218,12 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
 
         # --- Construct LM Studio format based on requested fields, using raw_metadata ---
 
-        # id: general.name (fallback to filename)
-        model_id_val = get_scalar_metadata(raw_metadata, 'general.name', os.path.basename(model_path))
-        # Ensure ID is a string
-        model_id = str(model_id_val) if model_id_val is not None else os.path.basename(model_path)
+        # id: general.name (fallback to filename) or use model_config["model_id"] if specified
+        if "model_id" in model_config:
+            model_id = model_config["model_id"]
+        else:
+            model_id_val = get_scalar_metadata(raw_metadata, 'general.name', os.path.basename(model_path))
+            model_id = str(model_id_val) if model_id_val is not None else os.path.basename(model_path)
 
         # object: "model" (static)
         obj_type = "model" # Static value as per LM Studio API
@@ -361,7 +363,7 @@ def extract_gguf_metadata(model_path: str) -> Optional[Dict[str, Any]]:
         # --- End debug logging ---
         return None
 
-def get_model_lmstudio_format(model_name: str, model_path: str, is_running: bool) -> Optional[Dict[str, Any]]:
+def get_model_lmstudio_format(model_name: str, model_path: str, model_config: Dict[str, Any], is_running: bool) -> Optional[Dict[str, Any]]:
     """
     Gets model metadata in LM Studio format, using cache if available.
     Includes the current running state.
@@ -369,7 +371,7 @@ def get_model_lmstudio_format(model_name: str, model_path: str, is_running: bool
     if not GGUF_AVAILABLE:
         # Return a minimal structure if GGUF library is not available
         return {
-            "id": model_name,
+            "id": model_name if "model_id" not in model_config else model_config["model_id"],
             "object": "model",
             "type": "llm", # Assume LLM if no metadata
             "publisher": "local",
@@ -385,7 +387,7 @@ def get_model_lmstudio_format(model_name: str, model_path: str, is_running: bool
     if file_size is None:
         logging.error(f"Could not get size for {model_path}. Cannot use cache.")
         # Fallback to extracting without caching if size retrieval fails
-        metadata = extract_gguf_metadata(model_path)
+        metadata = extract_gguf_metadata(model_path, model_config)
         if metadata:
              metadata["state"] = "loaded" if is_running else "not-loaded"
              # Add file size to the metadata, formatted human-readable
@@ -401,7 +403,7 @@ def get_model_lmstudio_format(model_name: str, model_path: str, is_running: bool
         return cached_metadata
     else:
         logging.info(f"Cache miss or invalid for {model_name} (size: {file_size}). Extracting metadata...")
-        extracted_metadata = extract_gguf_metadata(model_path)
+        extracted_metadata = extract_gguf_metadata(model_path, model_config)
         if extracted_metadata:
             # Add state and save to cache
             extracted_metadata["state"] = "loaded" if is_running else "not-loaded"
@@ -413,7 +415,7 @@ def get_model_lmstudio_format(model_name: str, model_path: str, is_running: bool
             logging.error(f"Failed to extract metadata for {model_name} at {model_path}")
             # Return a minimal structure if extraction fails
             return {
-                "id": model_name,
+                "id": model_name if "model_id" not in model_config else model_config["model_id"],
                 "object": "model",
                 "type": "llm", # Assume LLM if no metadata
                 "publisher": "local",
@@ -437,7 +439,7 @@ def get_all_models_lmstudio_format(models_config: Dict[str, Dict[str, Any]], is_
             continue
 
         is_running = is_model_running_callback(model_name)
-        metadata = get_model_lmstudio_format(model_name, model_path, is_running)
+        metadata = get_model_lmstudio_format(model_name, model_path, model_config, is_running)
         if metadata:
             all_models_data.append(metadata)
 
@@ -458,7 +460,7 @@ def get_single_model_lmstudio_format(model_name: str, models_config: Dict[str, D
         return None
 
     is_running = is_model_running_callback(model_name)
-    metadata = get_model_lmstudio_format(model_name, model_path, is_running)
+    metadata = get_model_lmstudio_format(model_name, model_path, model_config, is_running)
 
     return metadata
 
@@ -473,7 +475,7 @@ def get_model_name_to_id_mapping(models_config: Dict[str, Dict[str, Any]]) -> Di
     for model_name, model_config in models_config.items():
         model_path = model_config.get("model_path")
         if model_path:
-            metadata = get_model_lmstudio_format(model_name, model_path, False)
+            metadata = get_model_lmstudio_format(model_name, model_path, model_config, False)
             if metadata:
                 mapping[model_name] = metadata["id"]
     return mapping
