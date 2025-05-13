@@ -421,7 +421,8 @@ async def show_model_info(request: Request):
         try:
             # Use get_model_lmstudio_format to get metadata, including running state
             is_running = request.app.state.proxy_thread_instance.is_model_running_callback(model_name)
-            metadata = gguf_metadata.get_model_lmstudio_format(model_name, model_path, is_running)
+            model_config = request.app.state.all_models_config.get(model_name)
+            metadata = gguf_metadata.get_model_lmstudio_format(model_name, model_path, model_config, is_running)
 
             if not metadata:
                  logging.error(f"Failed to get metadata for {model_name} at {model_path}")

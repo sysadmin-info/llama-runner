@@ -211,17 +211,16 @@ class LlamaCppRunner:
                 except Exception as kill_e:
                     print(f"Error killing process {self.process.pid}: {kill_e}")
             except Exception as e:
-                 print(f"Error during process termination for {self.model_name}: {e}")
-
-            self.process = None # Clear the process reference after stopping
-            print(f"llama.cpp server for {self.model_name} stopped.")
+                print(f"Error during process termination for {self.model_name}: {e}")
+            finally:
+                # Emit a signal to notify the GUI that the server has stopped
+                self.stopped.emit()
         elif self.process and self.process.returncode is not None:
              print(f"llama.cpp server for {self.model_name} was already stopped (code {self.process.returncode}).")
              self.process = None # Ensure process reference is cleared
         else:
             print(f"llama.cpp server for {self.model_name} is not running (no process).")
             self.process = None # Ensure process reference is cleared
-
 
     def is_running(self):
         """

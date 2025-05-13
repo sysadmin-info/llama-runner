@@ -1,5 +1,7 @@
 import asyncio
 import os
+import sys
+import subprocess
 import logging
 import traceback
 from typing import Optional, Dict, Any # Import Callable
@@ -276,25 +278,6 @@ class ModelStatusWidget(QWidget):
             QLabel[text^="Port:"] {
                  font-weight: bold;
             }
-            QPushButton {
-                background-color: #007bff; /* Primary button color */
-                color: white;
-                border: none;
-                border-radius: 5px;
-                padding: 10px 15px; /* Padding for buttons */
-                font-size: 10pt;
-                margin-top: 10px;
-            }
-            QPushButton:hover {
-                background-color: #0056b3; /* Darker color on hover */
-            }
-            QPushButton:pressed {
-                background-color: #004085; /* Even darker color when pressed */
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-                color: #666666;
-            }
         """)
 
         # Update metadata display if metadata is provided
@@ -384,8 +367,11 @@ class MainWindow(QWidget):
         self._runner_startup_futures: Dict[str, asyncio.Future] = {}
 
 
-        # Use QHBoxLayout for side-by-side layout
-        self.layout = QHBoxLayout() # Main layout is now QHBoxLayout
+        # Main layout is now QVBoxLayout
+        self.layout = QVBoxLayout()
+
+        # Inner QHBoxLayout for model list and status stack
+        self.top_layout = QHBoxLayout()
 
         # Left side: Model List
         self.model_list_widget = QListWidget()
@@ -405,7 +391,7 @@ class MainWindow(QWidget):
                 margin-bottom: 4px; /* Add space between items */
                 background-color: #f0f0f0; /* Default item color */
                 border: none;
-                outline: none;   
+                outline: none;
             }
             QListWidget::item:selected {
                 background-color: #a0c0f0; /* Highlight color */
@@ -414,14 +400,14 @@ class MainWindow(QWidget):
                 outline: none;
             }
             QListWidget::item:selected:focus {
-                show-decoration-selected: false;                                 
+                show-decoration-selected: false;
             }
         """)
-        self.layout.addWidget(self.model_list_widget)
+        self.top_layout.addWidget(self.model_list_widget) # Add to top_layout
 
         # Right side: Model Status Stack
         self.model_status_stack = QStackedWidget()
-        self.layout.addWidget(self.model_status_stack)
+        self.top_layout.addWidget(self.model_status_stack) # Add to top_layout
 
         self.model_status_widgets: Dict[str, ModelStatusWidget] = {} # Store status widgets by model name
 
@@ -455,8 +441,18 @@ class MainWindow(QWidget):
         self.model_status_stack.setCurrentWidget(self.no_model_selected_widget) # Show placeholder initially
 
 
-        # The main layout now contains the model list and status stack directly
+        # Add the top layout (list and stack) to the main layout
+        self.layout.addLayout(self.top_layout)
+
+        # Add "Edit config" button at the bottom
+        self.edit_config_button = QPushButton("Edit config")
+        self.layout.addWidget(self.edit_config_button)
+
+        # Set the main layout
         self.setLayout(self.layout)
+
+        # Connect the "Edit config" button
+        self.edit_config_button.clicked.connect(self.open_config_file)
 
         # Connect buttons to actions (removed proxy buttons)
         # self.litellm_start_button.clicked.connect(self.start_litellm_proxy)
@@ -472,6 +468,29 @@ class MainWindow(QWidget):
         # --- Start the Ollama Proxy automatically ---
         self.start_ollama_proxy() # Add method call to start Ollama proxy
         # --- End automatic proxy start ---
+
+        # Add QPushButton styles to MainWindow stylesheet
+        self.setStyleSheet(self.styleSheet() + """
+            QPushButton {
+                background-color: #007bff; /* Primary button color */
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 10px 15px; /* Padding for buttons */
+                font-size: 10pt;
+                margin-top: 10px;
+            }
+            QPushButton:hover {
+                background-color: #0056b3; /* Darker color on hover */
+            }
+            QPushButton:pressed {
+                background-color: #004085; /* Even darker color when pressed */
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #666666;
+            }
+        """)
 
 
     def closeEvent(self, event):
@@ -526,7 +545,6 @@ class MainWindow(QWidget):
                  return True
             else:
                  # Thread is running, but runner process is not. This is an inconsistent state.
-                 # Log a warning and treat as not running.
                  logging.warning(f"Llama runner thread for {model_name} is running, but process is not.")
                  return False
         return False
@@ -613,7 +631,7 @@ class MainWindow(QWidget):
         model_path = model_config.get("model_path")
         llama_cpp_runtime_key = model_config.get("llama_cpp_runtime", "default")
         _raw_llama_cpp_runtime_config = self.llama_runtimes.get(llama_cpp_runtime_key, self.default_runtime)
-        
+
         # Extract the actual runtime command string
         if isinstance(_raw_llama_cpp_runtime_config, dict):
             llama_cpp_runtime_command = _raw_llama_cpp_runtime_config.get("runtime")
@@ -675,7 +693,7 @@ class MainWindow(QWidget):
 
     def _cleanup_completed_future(self, model_name: str):
         """Helper to remove a completed future from the dictionary after a delay."""
-        if model_name in self._runner_startup_futures and self._runner_startup_futures[model_name].done():
+        if model_name in self._runner_startup_futures and not self._runner_startup_futures[model_name].done():
              logging.debug(f"Cleaning up completed future for {model_name}")
              del self._runner_startup_futures[model_name]
 
@@ -743,8 +761,6 @@ class MainWindow(QWidget):
             request_runner_start_callback=self.request_runner_start, # Pass the callback method
             prompt_logging_enabled=self.prompt_logging_enabled, # Pass the flag
             prompts_logger=self.prompts_logger, # Pass the logger instance
-            # api_key is no longer passed if not used by our FastAPI app
-            # api_key=proxy_api_key,
         )
         # Connect signals from the proxy thread if needed (e.g., started, stopped, error)
         # self.fastapi_proxy_thread.started.connect(self.on_fastapi_proxy_started)
@@ -939,3 +955,33 @@ class MainWindow(QWidget):
 
         # Emit signal for the proxy thread
         self.runner_port_ready_for_proxy.emit(model_name, port)
+
+    def open_config_file(self):
+        """
+        Opens the config.json file in the system's default editor.
+        """
+        config_path = os.path.expanduser("~/.llama-runner/config.json")
+        logging.info(f"Attempting to open config file: {config_path}")
+
+        if not os.path.exists(config_path):
+            logging.error(f"Config file not found: {config_path}")
+            # Optionally show a message box to the user
+            # QMessageBox.critical(self, "Error", f"Config file not found:\n{config_path}")
+            return
+
+        try:
+            if sys.platform == "win32":
+                os.startfile(config_path)
+            elif sys.platform == "darwin": # macOS
+                subprocess.run(["open", config_path], check=True)
+            else: # linux variants
+                subprocess.run(["xdg-open", config_path], check=True)
+            logging.info(f"Successfully opened config file: {config_path}")
+        except FileNotFoundError:
+            logging.error(f"Could not find command to open file on {sys.platform}.")
+            # Optionally show a message box
+            # QMessageBox.critical(self, "Error", f"Could not find command to open file on {sys.platform}.")
+        except Exception as e:
+            logging.error(f"Error opening config file {config_path}: {e}")
+            # Optionally show a message box
+            # QMessageBox.critical(self, "Error", f"Error opening config file:\n{config_path}\n{e}")
