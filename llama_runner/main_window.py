@@ -88,6 +88,7 @@ class LlamaRunnerThread(QThread):
         self.runner = None
         self.is_running = False
         self._error_emitted = False # Flag to track if error signal was emitted
+        self._manual_stop_requested = False # Flag to indicate if stop was manual
 
     def run(self):
         """
@@ -170,8 +171,8 @@ class LlamaRunnerThread(QThread):
                     # Don't overwrite the main error_occurred flag
 
             # Check the final return code after ensuring the process is stopped
-            # Only emit error if one hasn't been emitted by the except block
-            if not self._error_emitted and self.runner and self.runner.process and self.runner.process.returncode != 0:
+            # Only emit error if one hasn't been emitted by the except block AND it wasn't a manual stop
+            if not self._error_emitted and not self._manual_stop_requested and self.runner and self.runner.process and self.runner.process.returncode != 0:
                 error_message = f"Llama.cpp server for {self.model_name} exited with code {self.runner.process.returncode}"
                 output_buffer = self.runner.get_output_buffer() if self.runner else []
                 logging.error(error_message)
@@ -188,6 +189,7 @@ class LlamaRunnerThread(QThread):
         The actual stopping happens in run_async.
         """
         self.is_running = False
+        self._manual_stop_requested = True # Set flag for manual stop
         # If the asyncio loop is running, schedule the stop coroutine
         if hasattr(self, 'loop') and self.loop.is_running():
              asyncio.run_coroutine_threadsafe(self._request_stop_runner(), self.loop)
