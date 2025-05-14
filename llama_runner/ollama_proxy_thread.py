@@ -624,7 +624,7 @@ class OllamaProxyThread(QThread):
         elif model_name in self._runner_ready_futures and self._runner_ready_futures[model_name].done():
              logging.warning(f"Received runner_port_ready for {model_name}, but local Future was already done.")
         else:
-             logging.warning(f"Received runner_port_ready for {model_name}, but no pending local Future found.")
+             logging.info(f"Received runner_port_ready for {model_name}, but no pending local Future found. This can occur if the runner was started outside the proxy's request flow or the Future was already resolved. No action needed.")
 
 
     @Slot(str)

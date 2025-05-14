@@ -4,13 +4,18 @@ import logging
 import re
 import collections # Import collections
 
+from PySide6 import QtCore
+from PySide6.QtCore import QObject, Signal
+
 from llama_runner.config_loader import CONFIG_DIR, LOG_FILE
 
 # Configure logging
 logging.basicConfig(filename=LOG_FILE, level=logging.ERROR,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
-class LlamaCppRunner:
+class LlamaCppRunner(QObject):
+    stopped = Signal() # Define the stopped signal
+
     def __init__(self, model_name: str, model_path: str, llama_cpp_runtime: str = None, **kwargs):
         """
         Initializes the LlamaCppRunner.
@@ -22,6 +27,7 @@ class LlamaCppRunner:
                 Defaults to None, which uses the llama-server from the PATH.
             **kwargs: Additional arguments to pass to llama-server.
         """
+        super().__init__() # Call QObject constructor
         self.model_name = model_name
         self.model_path = model_path
         self.llama_cpp_runtime = llama_cpp_runtime or "llama-server"
