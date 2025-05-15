@@ -11,16 +11,22 @@ class LlamaRunnerThread(QThread):
     """
     QThread to run the LlamaCppRunner in a separate thread to avoid blocking the UI.
     """
+    # Define a custom event type for signaling that the runner has stopped
+    STOPPED_EVENT_TYPE = QEvent.Type(QEvent.User + 5)
+
     started = Signal(str)
-    stopped = Signal(str)
+    # stopped = Signal(str) # Removed direct stopped signal
     error = Signal(str, list) # Signal includes error message and output buffer
     port_ready = Signal(str, int) # Signal includes model_name and port
 
-    def __init__(self, model_name: str, model_path: str, llama_cpp_runtime: str = None, **kwargs):
-        super().__init__()
+    def __init__(self, model_name: str, model_path: str, llama_cpp_runtime: str = None, parent=None, **kwargs):
+        super().__init__(parent)
         self.model_name = model_name
         self.model_path = model_path
         self.llama_cpp_runtime = llama_cpp_runtime
+        # Remove 'parent' from kwargs if present to avoid passing it to LlamaCppRunner
+        if 'parent' in kwargs:
+            del kwargs['parent']
         self.kwargs = kwargs
         self.runner = None
         self.is_running = False
@@ -132,7 +138,12 @@ class LlamaRunnerThread(QThread):
                 self._error_emitted = True # Set flag
 
             self.is_running = False # Ensure this is false
-            self.stopped.emit(self.model_name)
+            # self.stopped.emit(self.model_name) # Removed direct stopped signal
+
+            # Post a custom event to the parent (LlamaRunnerManager) to signal stopped
+            stopped_event = QEvent(LlamaRunnerThread.STOPPED_EVENT_TYPE)
+            stopped_event.model_name = self.model_name
+            QCoreApplication.instance().postEvent(self.parent(), stopped_event)
 
     async def _read_output_continuously(self):
         """

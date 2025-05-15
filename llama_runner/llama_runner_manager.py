@@ -20,6 +20,9 @@ class LlamaRunnerManager(QObject):
         parent=None,
     ):
         super().__init__(parent)
+        # Import here to avoid circular import issues
+        from llama_runner.llama_runner_thread import LlamaRunnerThread
+        self.LlamaRunnerThread = LlamaRunnerThread
         self.models = models
         self.llama_runtimes = llama_runtimes
         self.default_runtime = default_runtime
@@ -138,12 +141,13 @@ class LlamaRunnerManager(QObject):
             model_name=model_name,
             model_path=model_path,
             llama_cpp_runtime=llama_cpp_runtime_command,
+            parent=self,
             **model_config.get("parameters", {})
         )
         thread.started.connect(lambda name=model_name: self.on_llama_runner_started(name))
         thread.port_ready.connect(self.on_llama_runner_port_ready_and_emit)
         thread.error.connect(lambda message, output_buffer, name=model_name: self.on_llama_runner_error(name, message, output_buffer))
-        thread.stopped.connect(lambda name=model_name: self.on_llama_runner_stopped(name))
+        # thread.stopped.connect(lambda name=model_name: self.on_llama_runner_stopped(name))  # Removed, now handled by customEvent
 
         self.llama_runner_threads[model_name] = thread
         thread.start()
@@ -229,6 +233,15 @@ class LlamaRunnerManager(QObject):
         if model_name in self._runner_startup_futures and not self._runner_startup_futures[model_name].done():
             logging.debug(f"Runner {model_name} errored while startup Future was pending.")
             self._runner_startup_futures[model_name].set_exception(RuntimeError(f"Runner for {model_name} errored during startup: {message}"))
+
+    def customEvent(self, event):
+        # Handle custom stopped event from LlamaRunnerThread
+        if event.type() == self.LlamaRunnerThread.STOPPED_EVENT_TYPE:
+            model_name = getattr(event, 'model_name', None)
+            if model_name:
+                self.on_llama_runner_stopped(model_name)
+        else:
+            super().customEvent(event)
 
     @Slot(str, int)
     def on_llama_runner_port_ready_and_emit(self, model_name: str, port: int):
