@@ -80,7 +80,12 @@ async def _get_lmstudio_model_handler(model_id: str, request: Request):
 
 
 # --- Handler for dynamic routing of /v1/* requests ---
-async def _dynamic_route_v1_request_generator(request: Request, target_path: Optional[str] = None):
+async def _dynamic_route_v1_request_generator(
+    request: Request,
+    target_path: Optional[str] = None,
+    body: Optional[dict] = None,
+    body_bytes: Optional[bytes] = None
+):
     """
     Intercepts /v1/* requests, ensures the target runner is running,
     and forwards the request to the runner's port, yielding the response chunks.
@@ -98,16 +103,17 @@ async def _dynamic_route_v1_request_generator(request: Request, target_path: Opt
 
     # Extract the model name from the request body
     try:
-        body_bytes = await request.body()
-        body = {}
-        if body_bytes:
-            try:
-                body = json.loads(body_bytes)
-            except json.JSONDecodeError:
-                logging.warning(f"Could not decode request body as JSON for {request.url.path}")
-                yield b'data: {"error": "Invalid JSON request body."}\n\n'
-                return # Stop the generator
-
+        # If not provided, read the body here (for backward compatibility, but should always be passed in)
+        if body is None or body_bytes is None:
+            body_bytes = await request.body()
+            body = {}
+            if body_bytes:
+                try:
+                    body = json.loads(body_bytes)
+                except json.JSONDecodeError:
+                    logging.warning(f"Could not decode request body as JSON for {request.url.path}")
+                    yield b'data: {"error": "Invalid JSON request body."}\n\n'
+                    return # Stop the generator
         model_name_from_request = body.get("model") # This is the ID used by LM Studio (e.g., "vendor/model-name-gguf")
         if not model_name_from_request:
             logging.warning(f"Model name not found in request body for {request.url.path}")
@@ -388,22 +394,46 @@ async def _dynamic_route_v1_request_generator(request: Request, target_path: Opt
 async def _proxy_v0_chat_completions(request: Request):
     """Proxies /api/v0/chat/completions to /v1/chat/completions."""
     logging.debug("Proxying /api/v0/chat/completions to /v1/chat/completions")
-    # Return StreamingResponse with the generator
-    return StreamingResponse(content=_dynamic_route_v1_request_generator(request, target_path="/v1/chat/completions"))
+    try:
+        body_bytes = await request.body()
+        body = {}
+        if body_bytes:
+            body = json.loads(body_bytes)
+    except Exception as e:
+        logging.error(f"Error reading request body in /api/v0/chat/completions: {e}\n{traceback.format_exc()}")
+        body = {}
+        body_bytes = b""
+    return StreamingResponse(content=_dynamic_route_v1_request_generator(request, target_path="/v1/chat/completions", body=body, body_bytes=body_bytes))
 
 @app.post("/api/v0/embeddings")
 async def _proxy_v0_embeddings(request: Request):
     """Proxies /api/v0/embeddings to /v1/embeddings."""
     logging.debug("Proxying /api/v0/embeddings to /v1/embeddings")
-    # Return StreamingResponse with the generator
-    return StreamingResponse(content=_dynamic_route_v1_request_generator(request, target_path="/v1/embeddings"))
+    try:
+        body_bytes = await request.body()
+        body = {}
+        if body_bytes:
+            body = json.loads(body_bytes)
+    except Exception as e:
+        logging.error(f"Error reading request body in /api/v0/embeddings: {e}\n{traceback.format_exc()}")
+        body = {}
+        body_bytes = b""
+    return StreamingResponse(content=_dynamic_route_v1_request_generator(request, target_path="/v1/embeddings", body=body, body_bytes=body_bytes))
 
 @app.post("/api/v0/completions")
 async def _proxy_v0_completions(request: Request):
     """Proxies /api/v0/completions to /v1/completions."""
     logging.debug("Proxying /api/v0/completions to /v1/completions")
-    # Return StreamingResponse with the generator
-    return StreamingResponse(content=_dynamic_route_v1_request_generator(request, target_path="/v1/completions"))
+    try:
+        body_bytes = await request.body()
+        body = {}
+        if body_bytes:
+            body = json.loads(body_bytes)
+    except Exception as e:
+        logging.error(f"Error reading request body in /api/v0/completions: {e}\n{traceback.format_exc()}")
+        body = {}
+        body_bytes = b""
+    return StreamingResponse(content=_dynamic_route_v1_request_generator(request, target_path="/v1/completions", body=body, body_bytes=body_bytes))
 
 # --- End handlers for /api/v0/* proxying ---
 
@@ -470,18 +500,42 @@ current_v1_handlers = {route.path: route.endpoint for route in app.routes if rou
 # Add routes using the @app.post decorator
 @app.post("/v1/chat/completions")
 async def _v1_chat_completions_handler(request: Request):
-    # Return StreamingResponse with the generator
-    return StreamingResponse(content=_dynamic_route_v1_request_generator(request))
+    try:
+        body_bytes = await request.body()
+        body = {}
+        if body_bytes:
+            body = json.loads(body_bytes)
+    except Exception as e:
+        logging.error(f"Error reading request body in /v1/chat/completions: {e}\n{traceback.format_exc()}")
+        body = {}
+        body_bytes = b""
+    return StreamingResponse(content=_dynamic_route_v1_request_generator(request, body=body, body_bytes=body_bytes))
 
 @app.post("/v1/completions")
 async def _v1_completions_handler(request: Request):
-    # Return StreamingResponse with the generator
-    return StreamingResponse(content=_dynamic_route_v1_request_generator(request))
+    try:
+        body_bytes = await request.body()
+        body = {}
+        if body_bytes:
+            body = json.loads(body_bytes)
+    except Exception as e:
+        logging.error(f"Error reading request body in /v1/completions: {e}\n{traceback.format_exc()}")
+        body = {}
+        body_bytes = b""
+    return StreamingResponse(content=_dynamic_route_v1_request_generator(request, body=body, body_bytes=body_bytes))
 
 @app.post("/v1/embeddings")
 async def _v1_embeddings_handler(request: Request):
-    # Return StreamingResponse with the generator
-    return StreamingResponse(content=_dynamic_route_v1_request_generator(request))
+    try:
+        body_bytes = await request.body()
+        body = {}
+        if body_bytes:
+            body = json.loads(body_bytes)
+    except Exception as e:
+        logging.error(f"Error reading request body in /v1/embeddings: {e}\n{traceback.format_exc()}")
+        body = {}
+        body_bytes = b""
+    return StreamingResponse(content=_dynamic_route_v1_request_generator(request, body=body, body_bytes=body_bytes))
 
 logging.info("Added dynamic routing handlers for /v1/chat/completions, /v1/completions, /v1/embeddings.")
 
