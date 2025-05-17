@@ -283,11 +283,19 @@ async def generate_completion(request: Request):
                         else:
                             logging.debug("Empty chunk_str after decode/strip.")
                         for json_payload in blocks:
-                            logging.debug(f"Processing block: {repr(json_payload[:200])}")
-                            # Skip OpenAI's [DONE] marker
-                            if json_payload.strip() == "[DONE]":
-                                logging.debug("Skipping [DONE] marker from OpenAI stream.")
+                            block_stripped = json_payload.strip()
+                            # Extra debug for [DONE] handling
+                            logging.debug(f"Block raw: {repr(json_payload)} | stripped: {repr(block_stripped)}")
+                            # Robust skip for [DONE] marker (ignore case, whitespace, CRLF)
+                            if not block_stripped or block_stripped.upper().replace('\r', '').replace('\n', '') == "[DONE]":
+                                logging.debug(f"Skipping block: {repr(json_payload[:200])}")
                                 continue
+                            # Only log and process if not skipped
+                            logging.debug(f"Block raw: {repr(json_payload)} | stripped: {repr(block_stripped)}")
+                            if not block_stripped or block_stripped.upper().replace('\r', '').replace('\n', '') == "[DONE]":
+                                logging.debug(f"Skipping block: {repr(json_payload[:200])}")
+                                continue
+                            logging.debug(f"Processing block: {repr(json_payload[:200])}")
                             try:
                                 openai_resp = json.loads(json_payload)
                                 logging.debug(f"Parsed OpenAI JSON: {openai_resp}")
@@ -383,6 +391,12 @@ async def chat_completion(request: Request):
                         else:
                             logging.debug("Empty chunk_str after decode/strip.")
                         for json_payload in blocks:
+                            # Only log and process if not skipped
+                            block_stripped = json_payload.strip()
+                            logging.debug(f"Block raw: {repr(json_payload)} | stripped: {repr(block_stripped)}")
+                            if not block_stripped or block_stripped.upper().replace('\r', '').replace('\n', '') == "[DONE]":
+                                logging.debug(f"Skipping block: {repr(json_payload[:200])}")
+                                continue
                             logging.debug(f"Processing block: {repr(json_payload[:200])}")
                             try:
                                 openai_resp = json.loads(json_payload)
