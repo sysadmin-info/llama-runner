@@ -263,9 +263,14 @@ async def generate_completion(request: Request):
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error routing request to runner")
         else:
             # Streaming: use the generator logic
+            import time
             async def generate_response_stream():
                 prev_ollama_resp = None
                 saw_stop = False
+                start_time_ns = time.perf_counter_ns()
+                eval_count = 0
+                first_token_time_ns = None
+                last_token_time_ns = None
 
                 async for chunk in _dynamic_route_runner_request_generator(request, target_path="/v1/completions", request_body=openai_req):
                     try:
@@ -311,12 +316,37 @@ async def generate_completion(request: Request):
                                 if prev_ollama_resp is not None:
                                     prev_ollama_resp["done"] = False
                                     logging.debug(f"Yielding Ollama chunk (done: false): {prev_ollama_resp}")
-                                    yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
+                                    resp_to_yield = prev_ollama_resp
+                                    if not isinstance(resp_to_yield, dict):
+                                        resp_to_yield = {"response": str(resp_to_yield)}
+                                    # Count eval tokens (non-empty content)
+                                    if resp_to_yield.get("response"):
+                                        eval_count += 1
+                                        now_ns = time.perf_counter_ns()
+                                        if first_token_time_ns is None:
+                                            first_token_time_ns = now_ns
+                                        last_token_time_ns = now_ns
+                                    yield (json.dumps(resp_to_yield) + "\n").encode('utf-8')
                                 prev_ollama_resp = ollama_resp
                                 if finish_reason == "stop":
                                     prev_ollama_resp["done"] = True
                                     logging.debug(f"Yielding Ollama chunk (done: true): {prev_ollama_resp}")
-                                    yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
+                                    resp_to_yield = prev_ollama_resp
+                                    if not isinstance(resp_to_yield, dict):
+                                        resp_to_yield = {"response": str(resp_to_yield)}
+                                    # Add Ollama-style final fields
+                                    end_time_ns = time.perf_counter_ns()
+                                    resp_to_yield["done_reason"] = "stop"
+                                    resp_to_yield["total_duration"] = str(end_time_ns - start_time_ns)
+                                    resp_to_yield["load_duration"] = "0"
+                                    resp_to_yield["prompt_eval_count"] = "0"
+                                    resp_to_yield["prompt_eval_duration"] = "0"
+                                    resp_to_yield["eval_count"] = str(eval_count)
+                                    if first_token_time_ns is not None and last_token_time_ns is not None:
+                                        resp_to_yield["eval_duration"] = str(last_token_time_ns - first_token_time_ns)
+                                    else:
+                                        resp_to_yield["eval_duration"] = "0"
+                                    yield (json.dumps(resp_to_yield) + "\n").encode('utf-8')
                                     prev_ollama_resp = None
                                     saw_stop = True
                                     break
@@ -333,7 +363,27 @@ async def generate_completion(request: Request):
                 # If stream ended and we have a buffered chunk, yield it as done: true
                 if prev_ollama_resp is not None and not saw_stop:
                     prev_ollama_resp["done"] = True
-                    yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
+                    # Remove empty message/response fields for final chunk
+                    if "message" in prev_ollama_resp and (not prev_ollama_resp["message"] or prev_ollama_resp["message"] == {}):
+                        del prev_ollama_resp["message"]
+                    if "response" in prev_ollama_resp and (not prev_ollama_resp["response"] or prev_ollama_resp["response"] == ""):
+                        del prev_ollama_resp["response"]
+                    resp_to_yield = prev_ollama_resp
+                    if not isinstance(resp_to_yield, dict):
+                        resp_to_yield = {"response": str(resp_to_yield)}
+                    # Add Ollama-style final fields
+                    end_time_ns = time.perf_counter_ns()
+                    resp_to_yield["done_reason"] = "stop"
+                    resp_to_yield["total_duration"] = str(end_time_ns - start_time_ns)
+                    resp_to_yield["load_duration"] = "0"
+                    resp_to_yield["prompt_eval_count"] = "0"
+                    resp_to_yield["prompt_eval_duration"] = "0"
+                    resp_to_yield["eval_count"] = str(eval_count)
+                    if first_token_time_ns is not None and last_token_time_ns is not None:
+                        resp_to_yield["eval_duration"] = str(last_token_time_ns - first_token_time_ns)
+                    else:
+                        resp_to_yield["eval_duration"] = "0"
+                    yield (json.dumps(resp_to_yield) + "\n").encode('utf-8')
 
             return StreamingResponse(content=generate_response_stream(), media_type="text/event-stream")
 
@@ -372,9 +422,14 @@ async def chat_completion(request: Request):
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error routing request to runner")
         else:
             # Streaming: use the generator logic
+            import time
             async def chat_response_stream():
                 prev_ollama_resp = None
                 saw_stop = False
+                start_time_ns = time.perf_counter_ns()
+                eval_count = 0
+                first_token_time_ns = None
+                last_token_time_ns = None
 
                 async for chunk in _dynamic_route_runner_request_generator(request, target_path="/v1/chat/completions", request_body=openai_req):
                     try:
@@ -412,12 +467,38 @@ async def chat_completion(request: Request):
                                 if prev_ollama_resp is not None:
                                     prev_ollama_resp["done"] = False
                                     logging.debug(f"Yielding Ollama chunk (done: false): {prev_ollama_resp}")
-                                    yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
+                                    resp_to_yield = prev_ollama_resp
+                                    if not isinstance(resp_to_yield, dict):
+                                        resp_to_yield = {"message": str(resp_to_yield)}
+                                    # Count eval tokens (non-empty content)
+                                    msg = resp_to_yield.get("message", {})
+                                    if isinstance(msg, dict) and msg.get("content"):
+                                        eval_count += 1
+                                        now_ns = time.perf_counter_ns()
+                                        if first_token_time_ns is None:
+                                            first_token_time_ns = now_ns
+                                        last_token_time_ns = now_ns
+                                    yield (json.dumps(resp_to_yield) + "\n").encode('utf-8')
                                 prev_ollama_resp = ollama_resp
                                 if finish_reason == "stop":
                                     prev_ollama_resp["done"] = True
                                     logging.debug(f"Yielding Ollama chunk (done: true): {prev_ollama_resp}")
-                                    yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
+                                    resp_to_yield = prev_ollama_resp
+                                    if not isinstance(resp_to_yield, dict):
+                                        resp_to_yield = {"message": str(resp_to_yield)}
+                                    # Add Ollama-style final fields
+                                    end_time_ns = time.perf_counter_ns()
+                                    resp_to_yield["done_reason"] = "stop"
+                                    resp_to_yield["total_duration"] = str(end_time_ns - start_time_ns)
+                                    resp_to_yield["load_duration"] = "0"
+                                    resp_to_yield["prompt_eval_count"] = "0"
+                                    resp_to_yield["prompt_eval_duration"] = "0"
+                                    resp_to_yield["eval_count"] = str(eval_count)
+                                    if first_token_time_ns is not None and last_token_time_ns is not None:
+                                        resp_to_yield["eval_duration"] = str(last_token_time_ns - first_token_time_ns)
+                                    else:
+                                        resp_to_yield["eval_duration"] = "0"
+                                    yield (json.dumps(resp_to_yield) + "\n").encode('utf-8')
                                     prev_ollama_resp = None
                                     saw_stop = True
                                     break
@@ -433,7 +514,27 @@ async def chat_completion(request: Request):
 
                 if prev_ollama_resp is not None and not saw_stop:
                     prev_ollama_resp["done"] = True
-                    yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
+                    # Remove empty message/response fields for final chunk
+                    if "message" in prev_ollama_resp and (not prev_ollama_resp["message"] or prev_ollama_resp["message"] == {}):
+                        del prev_ollama_resp["message"]
+                    if "response" in prev_ollama_resp and (not prev_ollama_resp["response"] or prev_ollama_resp["response"] == ""):
+                        del prev_ollama_resp["response"]
+                    resp_to_yield = prev_ollama_resp
+                    if not isinstance(resp_to_yield, dict):
+                        resp_to_yield = {"message": str(resp_to_yield)}
+                    # Add Ollama-style final fields
+                    end_time_ns = time.perf_counter_ns()
+                    resp_to_yield["done_reason"] = "stop"
+                    resp_to_yield["total_duration"] = str(end_time_ns - start_time_ns)
+                    resp_to_yield["load_duration"] = "0"
+                    resp_to_yield["prompt_eval_count"] = "0"
+                    resp_to_yield["prompt_eval_duration"] = "0"
+                    resp_to_yield["eval_count"] = str(eval_count)
+                    if first_token_time_ns is not None and last_token_time_ns is not None:
+                        resp_to_yield["eval_duration"] = str(last_token_time_ns - first_token_time_ns)
+                    else:
+                        resp_to_yield["eval_duration"] = "0"
+                    yield (json.dumps(resp_to_yield) + "\n").encode('utf-8')
 
             return StreamingResponse(content=chat_response_stream(), media_type="text/event-stream")
 
