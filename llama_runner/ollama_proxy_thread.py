@@ -241,38 +241,73 @@ async def generate_completion(request: Request):
     try:
         ollama_req = await request.json()
         openai_req = generateRequestFromOllama(ollama_req)
+        # Ensure the stream parameter is passed through to the OpenAI backend
+        openai_req["stream"] = ollama_req.get("stream", True)
+        is_stream = ollama_req.get("stream", True)
 
-        # Use the dynamic router to forward the converted request to the runner
-        # The target path for completions in OpenAI format is typically /v1/completions
-        async def generate_response_stream():
-            prev_ollama_resp = None
-            saw_stop = False
-
+        if not is_stream:
+            # Non-streaming: forward, read full response, convert, return JSONResponse
             async for chunk in _dynamic_route_runner_request_generator(request, target_path="/v1/completions", request_body=openai_req):
                 try:
-                    chunk_str = chunk.decode('utf-8')
-                    for block in chunk_str.strip().split('\n\n'):
-                        if block.startswith('data: '):
-                            json_payload = block[len('data: '):]
+                    openai_resp = json.loads(chunk.decode('utf-8'))
+                    ollama_resp = generateResponseToOllama(openai_resp)
+                    ollama_resp["done"] = True
+                    return JSONResponse(content=ollama_resp)
+                except json.JSONDecodeError:
+                    logging.warning(f"Could not decode JSON from runner response: {chunk.decode('utf-8')}")
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid JSON response from runner")
+                except Exception as conv_e:
+                    logging.error(f"Error converting OpenAI response to Ollama format: {conv_e}\n{traceback.format_exc()}")
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error converting response")
+            # If the generator finishes without yielding, it means an error occurred in the router
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error routing request to runner")
+        else:
+            # Streaming: use the generator logic
+            async def generate_response_stream():
+                prev_ollama_resp = None
+                saw_stop = False
+
+                async for chunk in _dynamic_route_runner_request_generator(request, target_path="/v1/completions", request_body=openai_req):
+                    try:
+                        logging.debug(f"Received chunk from backend (len={len(chunk)}): {repr(chunk[:200])}")
+                        chunk_str = chunk.decode('utf-8').strip()
+                        logging.debug(f"Decoded chunk_str: {repr(chunk_str[:200])}")
+                        # Try to handle both SSE (data: ...) and plain JSON
+                        blocks = []
+                        if "data: " in chunk_str:
+                            blocks = [b[len("data: "):] for b in chunk_str.split('\n\n') if b.startswith("data: ")]
+                            logging.debug(f"SSE blocks found: {len(blocks)}")
+                        elif chunk_str:
+                            blocks = [chunk_str]
+                            logging.debug("No SSE prefix, treating as single JSON block.")
+                        else:
+                            logging.debug("Empty chunk_str after decode/strip.")
+                        for json_payload in blocks:
+                            logging.debug(f"Processing block: {repr(json_payload[:200])}")
+                            # Skip OpenAI's [DONE] marker
+                            if json_payload.strip() == "[DONE]":
+                                logging.debug("Skipping [DONE] marker from OpenAI stream.")
+                                continue
                             try:
                                 openai_resp = json.loads(json_payload)
+                                logging.debug(f"Parsed OpenAI JSON: {openai_resp}")
                                 ollama_resp = generateResponseToOllama(openai_resp)
+                                logging.debug(f"Converted to Ollama format: {ollama_resp}")
                                 # Determine if this is the final chunk (OpenAI: finish_reason == "stop")
                                 finish_reason = None
                                 if isinstance(openai_resp, dict):
-                                    # OpenAI completion: finish_reason at top level or in choices[0]
                                     if "finish_reason" in openai_resp:
                                         finish_reason = openai_resp.get("finish_reason")
                                     elif "choices" in openai_resp and openai_resp["choices"]:
                                         finish_reason = openai_resp["choices"][0].get("finish_reason")
-                                # Buffer previous chunk, yield with done: false
                                 if prev_ollama_resp is not None:
                                     prev_ollama_resp["done"] = False
+                                    logging.debug(f"Yielding Ollama chunk (done: false): {prev_ollama_resp}")
                                     yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
                                 prev_ollama_resp = ollama_resp
-                                # If this is the final chunk, yield it with done: true and break
                                 if finish_reason == "stop":
                                     prev_ollama_resp["done"] = True
+                                    logging.debug(f"Yielding Ollama chunk (done: true): {prev_ollama_resp}")
                                     yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
                                     prev_ollama_resp = None
                                     saw_stop = True
@@ -283,18 +318,16 @@ async def generate_completion(request: Request):
                             except Exception as conv_e:
                                 logging.error(f"Error converting OpenAI response to Ollama format: {conv_e}\n{traceback.format_exc()}")
                                 yield f'data: {{"error": "Error converting response: {conv_e}"}}\n\n'.encode('utf-8')
-                        else:
-                            pass
-                except Exception as e:
-                    logging.error(f"Error processing runner response chunk: {e}\n{traceback.format_exc()}")
-                    yield f'data: {{"error": "Error processing response chunk: {e}"}}\n\n'.encode('utf-8')
+                    except Exception as e:
+                        logging.error(f"Error processing runner response chunk: {e}\n{traceback.format_exc()}")
+                        yield f'data: {{"error": "Error processing response chunk: {e}"}}\n\n'.encode('utf-8')
 
-            # If stream ended and we have a buffered chunk, yield it as done: true
-            if prev_ollama_resp is not None and not saw_stop:
-                prev_ollama_resp["done"] = True
-                yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
+                # If stream ended and we have a buffered chunk, yield it as done: true
+                if prev_ollama_resp is not None and not saw_stop:
+                    prev_ollama_resp["done"] = True
+                    yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
 
-        return StreamingResponse(content=generate_response_stream(), media_type="text/event-stream")
+            return StreamingResponse(content=generate_response_stream(), media_type="text/event-stream")
 
     except json.JSONDecodeError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON request body")
@@ -309,23 +342,53 @@ async def chat_completion(request: Request):
     try:
         ollama_req = await request.json()
         openai_req = chatRequestFromOllama(ollama_req)
+        # Ensure the stream parameter is passed through to the OpenAI backend
+        openai_req["stream"] = ollama_req.get("stream", True)
+        is_stream = ollama_req.get("stream", True)
 
-        # Use the dynamic router to forward the converted request to the runner
-        # The target path for chat completions in OpenAI format is typically /v1/chat/completions
-        async def chat_response_stream():
-            prev_ollama_resp = None
-            saw_stop = False
-
+        if not is_stream:
+            # Non-streaming: forward, read full response, convert, return JSONResponse
             async for chunk in _dynamic_route_runner_request_generator(request, target_path="/v1/chat/completions", request_body=openai_req):
                 try:
-                    chunk_str = chunk.decode('utf-8')
-                    for block in chunk_str.strip().split('\n\n'):
-                        if block.startswith('data: '):
-                            json_payload = block[len('data: '):]
+                    openai_resp = json.loads(chunk.decode('utf-8'))
+                    ollama_resp = chatResponseToOllama(openai_resp)
+                    ollama_resp["done"] = True
+                    return JSONResponse(content=ollama_resp)
+                except json.JSONDecodeError:
+                    logging.warning(f"Could not decode JSON from runner response: {chunk.decode('utf-8')}")
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid JSON response from runner")
+                except Exception as conv_e:
+                    logging.error(f"Error converting OpenAI response to Ollama format: {conv_e}\n{traceback.format_exc()}")
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error converting response")
+            # If the generator finishes without yielding, it means an error occurred in the router
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error routing request to runner")
+        else:
+            # Streaming: use the generator logic
+            async def chat_response_stream():
+                prev_ollama_resp = None
+                saw_stop = False
+
+                async for chunk in _dynamic_route_runner_request_generator(request, target_path="/v1/chat/completions", request_body=openai_req):
+                    try:
+                        logging.debug(f"Received chunk from backend (len={len(chunk)}): {repr(chunk[:200])}")
+                        chunk_str = chunk.decode('utf-8').strip()
+                        logging.debug(f"Decoded chunk_str: {repr(chunk_str[:200])}")
+                        blocks = []
+                        if "data: " in chunk_str:
+                            blocks = [b[len("data: "):] for b in chunk_str.split('\n\n') if b.startswith("data: ")]
+                            logging.debug(f"SSE blocks found: {len(blocks)}")
+                        elif chunk_str:
+                            blocks = [chunk_str]
+                            logging.debug("No SSE prefix, treating as single JSON block.")
+                        else:
+                            logging.debug("Empty chunk_str after decode/strip.")
+                        for json_payload in blocks:
+                            logging.debug(f"Processing block: {repr(json_payload[:200])}")
                             try:
                                 openai_resp = json.loads(json_payload)
+                                logging.debug(f"Parsed OpenAI JSON: {openai_resp}")
                                 ollama_resp = chatResponseToOllama(openai_resp)
-                                # Determine if this is the final chunk (OpenAI: finish_reason == "stop")
+                                logging.debug(f"Converted to Ollama format: {ollama_resp}")
                                 finish_reason = None
                                 if isinstance(openai_resp, dict):
                                     if "finish_reason" in openai_resp:
@@ -334,10 +397,12 @@ async def chat_completion(request: Request):
                                         finish_reason = openai_resp["choices"][0].get("finish_reason")
                                 if prev_ollama_resp is not None:
                                     prev_ollama_resp["done"] = False
+                                    logging.debug(f"Yielding Ollama chunk (done: false): {prev_ollama_resp}")
                                     yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
                                 prev_ollama_resp = ollama_resp
                                 if finish_reason == "stop":
                                     prev_ollama_resp["done"] = True
+                                    logging.debug(f"Yielding Ollama chunk (done: true): {prev_ollama_resp}")
                                     yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
                                     prev_ollama_resp = None
                                     saw_stop = True
@@ -348,17 +413,15 @@ async def chat_completion(request: Request):
                             except Exception as conv_e:
                                 logging.error(f"Error converting OpenAI response to Ollama format: {conv_e}\n{traceback.format_exc()}")
                                 yield f'data: {{"error": "Error converting response: {conv_e}"}}\n\n'.encode('utf-8')
-                        else:
-                            pass
-                except Exception as e:
-                    logging.error(f"Error processing runner response chunk: {e}\n{traceback.format_exc()}")
-                    yield f'data: {{"error": "Error processing response chunk: {e}"}}\n\n'.encode('utf-8')
+                    except Exception as e:
+                        logging.error(f"Error processing runner response chunk: {e}\n{traceback.format_exc()}")
+                        yield f'data: {{"error": "Error processing response chunk: {e}"}}\n\n'.encode('utf-8')
 
-            if prev_ollama_resp is not None and not saw_stop:
-                prev_ollama_resp["done"] = True
-                yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
+                if prev_ollama_resp is not None and not saw_stop:
+                    prev_ollama_resp["done"] = True
+                    yield f"data: {json.dumps(prev_ollama_resp)}\n\n".encode('utf-8')
 
-        return StreamingResponse(content=chat_response_stream(), media_type="text/event-stream")
+            return StreamingResponse(content=chat_response_stream(), media_type="text/event-stream")
 
     except json.JSONDecodeError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON request body")

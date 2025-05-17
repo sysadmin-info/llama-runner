@@ -39,13 +39,24 @@ def generateRequestFromOllama(ollama_req: dict) -> dict:
 
 def generateResponseToOllama(openai_resp: dict) -> dict:
     """
-    Converts an OpenAI completion response to Ollama format.
-    OpenAI: { choices: [ { text, finish_reason } ], usage?, id?, ... }
-    Ollama: { response, done }
+    Converts an OpenAI completion response (including streaming) to Ollama format.
+    Handles both full and streaming (delta) responses.
     """
     choice = openai_resp.get("choices", [{}])[0]
+    # Handle streaming delta
+    delta = choice.get("delta", {})
+    response = ""
+    if "content" in delta:
+        response = delta["content"]
+    # Fallback to full text if present
+    if not response and "text" in choice:
+        response = choice["text"]
+    model = openai_resp.get("model", "")
+    created_at = datetime.datetime.utcnow().isoformat() + "Z"
     return {
-        "response": choice.get("text", ""),
+        "model": model,
+        "created_at": created_at,
+        "response": response,
         "done": choice.get("finish_reason") == "stop"
     }
 
@@ -65,14 +76,30 @@ def chatRequestFromOllama(ollama_req: dict) -> dict:
     }
 
 
+import datetime
+
 def chatResponseToOllama(openai_resp: dict) -> dict:
     """
-    Converts an OpenAI chat completion response to Ollama format.
-    OpenAI: { choices: [ { message: { role, content }, finish_reason } ], ... }
-    Ollama: { message: { role, content }, done }
+    Converts an OpenAI chat completion response (including streaming) to Ollama format.
+    Handles both full and streaming (delta) responses.
     """
     choice = openai_resp.get("choices", [{}])[0]
+    # Handle streaming delta
+    delta = choice.get("delta", {})
+    message = {}
+    if "role" in delta:
+        message["role"] = delta["role"]
+    if "content" in delta:
+        message["content"] = delta["content"]
+    # Fallback to full message if present
+    if not message and "message" in choice:
+        message = choice["message"]
+    # Always include model and created_at
+    model = openai_resp.get("model", "")
+    created_at = datetime.datetime.utcnow().isoformat() + "Z"
     return {
-        "message": choice.get("message", {}),
+        "model": model,
+        "created_at": created_at,
+        "message": message,
         "done": choice.get("finish_reason") == "stop"
     }
