@@ -1,135 +1,111 @@
+import os
 import sys
-import logging # Import logging
-import argparse # Import argparse
-import os # Import os
-from datetime import datetime # Import datetime
-from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QIcon # Import QIcon
+import argparse
+import json
+import subprocess
+import shlex
 
-# Import CONFIG_DIR and ensure_config_exists
-from llama_runner.config_loader import CONFIG_DIR, ensure_config_exists
+CONFIG_PATH = os.path.expanduser('~/.llama-runner/config.json')
 
-# Import the MainWindow class from your UI file
-# Import this *after* configuring logging
-from llama_runner.main_window import MainWindow
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        print(f"Config not found: {CONFIG_PATH}")
+        sys.exit(1)
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def choose_model(models):
+    print("Available models:")
+    for idx, model_name in enumerate(models):
+        print(f"{idx + 1}. {model_name}")
+    while True:
+        choice = input("Choose model (number): ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
+            return list(models.keys())[int(choice)-1]
+        print("Invalid choice. Try again.")
+
+def model_to_args(model_info, extra_args=None):
+    # Mapowanie parametrów z config.json na flagi CLI
+    param_map = {
+        "ctx_size": "--ctx-size",
+        "gpu_layers": "--gpu-layers",
+        "no_kv_offload": "--no-kv-offload",
+        "cache-type-k": "--cache-type-k",
+        "cache-type-v": "--cache-type-v",
+        "flash-attn": "--flash-attn",
+        "min_p": "--min-p",
+        "top_p": "--top-p",
+        "top_k": "--top-k",
+        "temp": "--temp",
+        "rope-scale": "--rope-scale",
+        "yarn-orig-ctx": "--yarn-orig-ctx",
+        "jinja": "--jinja"
+    }
+    args = []
+    params = model_info.get("parameters", {})
+    for key, cli_flag in param_map.items():
+        if key in params:
+            val = params[key]
+            if isinstance(val, bool) and val:
+                args.append(cli_flag)
+            elif not isinstance(val, bool):
+                # --flag value lub --flag value1 value2 jeśli "cache-type"
+                if key.startswith("cache-type"):
+                    args.extend(cli_flag.split() + [str(val)])
+                else:
+                    args.append(cli_flag)
+                    args.append(str(val))
+    if extra_args:
+        args += extra_args
+    return args
 
 def main():
-    """
-    Initializes and runs the PySide6 application.
-    Configures logging to console and a file.
-    """
-    # Set up argument parsing
-    parser = argparse.ArgumentParser(description="Llama Runner GUI application.")
-    parser.add_argument(
-        "--log-level",
-        default="INFO", # Default to INFO
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Set the minimum logging level for console output (DEBUG, INFO, WARNING, ERROR, CRITICAL)"
-    )
-    parser.add_argument(
-        "--log-prompts",
-        action="store_true", # Store as boolean flag
-        help="Enable logging of prompts (requests and responses) to a dedicated file."
-    )
+    parser = argparse.ArgumentParser(description="Llama Runner CLI (no GUI)")
+    parser.add_argument('--host', type=str, default="0.0.0.0", help="Host to bind server (default: 0.0.0.0)")
+    parser.add_argument('--port', type=int, default=8080, help="Port to bind server (default: 8080)")
     args = parser.parse_args()
 
-    # Ensure config directory exists for log files
-    ensure_config_exists()
+    config = load_config()
+    models = config.get("models", {})
 
-    # Map string level to logging constant for console handler
+    if not models:
+        print("No models defined in config.json.")
+        sys.exit(2)
 
-    # Get the root logger
-    root_logger = logging.getLogger()
+    model_name = choose_model(models)
+    model_info = models[model_name]
 
-    # Set the root logger level to DEBUG. This ensures that messages of all levels
-    # are processed by the logger and passed to handlers. Handlers will then filter
-    # based on their own levels.
-    root_logger.setLevel(logging.DEBUG)
+    print("\nSelected model:")
+    print(f"  Name: {model_name}")
+    print(f"  Model file: {model_info.get('model_path')}")
+    print(f"  Runtime: {model_info.get('llama_cpp_runtime')}")
+    print("  Parameters:")
+    for k, v in model_info.get('parameters', {}).items():
+        print(f"    {k}: {v}")
 
-    # Remove any default handlers added by basicConfig if it was called implicitly
-    # before this point (e.g., by an imported module's top-level logging call).
-    # This ensures we have full control over handlers.
-    if root_logger.hasHandlers():
-        # Iterate over a copy of the list to allow removal
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
+    # Pobierz ścieżkę do runtime
+    runtimes = config.get("llama-runtimes", {})
+    runtime_key = model_info.get('llama_cpp_runtime', 'default')
+    runtime_path = runtimes.get(runtime_key, {}).get("runtime", "/home/adrian/llama.cpp/build/bin/llama-server")
 
-    # Create formatter
-    # Added %(name)s to the format to show which logger emitted the message
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+    if not os.path.isabs(runtime_path):
+        runtime_path = "/home/adrian/llama.cpp/build/bin/llama-server"
 
-    # Create console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    # Set console level based on argument
-    if args.log_level.upper() == "DEBUG":
-        console_handler.setLevel(logging.DEBUG)
-    elif args.log_level.upper() == "INFO":
-        console_handler.setLevel(logging.INFO)
-    elif args.log_level.upper() == "WARNING":
-        console_handler.setLevel(logging.WARNING)
-    elif args.log_level.upper() == "ERROR":
-        console_handler.setLevel(logging.ERROR)
-    elif args.log_level.upper() == "CRITICAL":
-        console_handler.setLevel(logging.CRITICAL)
-    else:
-        # Default to INFO if somehow an invalid level got through argparse
-        console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    root_logger.addHandler(console_handler)
+    # Zbuduj listę argumentów
+    cli_args = [runtime_path, "-m", model_info["model_path"]]
+    cli_args += ["--host", args.host, "--port", str(args.port)]
+    cli_args += model_to_args(model_info)
 
-    # Create file handler for app.log
-    app_log_file_path = os.path.join(CONFIG_DIR, "app.log")
+    print("\nUruchamiam runner:")
+    print(" ".join(shlex.quote(arg) for arg in cli_args))
+
+    # Odpal serwer na stałe (z terminala, nie capture_output)
     try:
-        app_file_handler = logging.FileHandler(app_log_file_path)
-        # Set file level to DEBUG to capture all messages (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-        app_file_handler.setLevel(logging.DEBUG)
-        app_file_handler.setFormatter(formatter)
-        root_logger.addHandler(app_file_handler)
-        logging.info(f"App file logging enabled. Log file path: {app_log_file_path}")
+        subprocess.run(cli_args)
+    except KeyboardInterrupt:
+        print("\nZatrzymano serwer.")
     except Exception as e:
-        logging.error(f"Failed to create app file handler for {app_log_file_path}: {e}")
-
-    # Create a dedicated logger for prompts
-    prompts_logger = logging.getLogger("prompts")
-    prompts_logger.setLevel(logging.DEBUG) # Set level to DEBUG to capture all prompt messages
-
-    # If --log-prompts is enabled, add a file handler for prompts
-    if args.log_prompts:
-        prompt_log_filename = f"prompts-{datetime.now().strftime('%Y%m%d')}.log"
-        prompt_log_file_path = os.path.join(CONFIG_DIR, prompt_log_filename)
-        try:
-            prompt_file_handler = logging.FileHandler(prompt_log_file_path)
-            # Use the same formatter, or a different one if preferred
-            prompt_file_handler.setFormatter(formatter)
-            # Set level for prompt file handler (e.g., INFO or DEBUG)
-            prompt_file_handler.setLevel(logging.INFO) # Log INFO and above for prompts
-            prompts_logger.addHandler(prompt_file_handler)
-            logging.info(f"Prompt logging enabled. Log file path: {prompt_log_file_path}")
-        except Exception as e:
-            logging.error(f"Failed to create prompt file handler for {prompt_log_file_path}: {e}")
-
-    # Store the prompt logging state to be passed to proxy threads
-    prompt_logging_enabled = args.log_prompts
-
-    logging.info(f"Console logging level set to {args.log_level.upper()}")
-    logging.info(f"Prompt logging is {'enabled' if prompt_logging_enabled else 'disabled'}")
-
-
-    # Create the Qt application instance
-    app = QApplication(sys.argv)
-
-    # Set the application icon
-    app.setWindowIcon(QIcon('app_icon.png'))
-
-    # Create the main window instance
-    # Pass the prompt logging state to the MainWindow
-    window = MainWindow(prompt_logging_enabled=prompt_logging_enabled)
-
-    # Show the main window
-    window.show()
-
-    # Start the Qt event loop
-    sys.exit(app.exec())
+        print(f"\nRunner error: {e}")
 
 if __name__ == "__main__":
     main()
