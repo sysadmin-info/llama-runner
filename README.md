@@ -8,7 +8,7 @@ $ git clone https://github.com/pwilkin/llama-runner
 $ cd llama-runner
 $ mkdir dev-venv
 $ python -m venv dev-venv
-$ source dev-venv/bin/activate (or dev-venv\bin\Activate.ps1 on Windows)
+$ source dev-venv/bin/activate (or .\dev-venv\Scripts\Activate.ps1 on Windows)
 $ pip install -r requirements.txt
 ... create ~/.llama-runner/config.json ...
 $ python main.py
