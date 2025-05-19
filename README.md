@@ -23,26 +23,30 @@ $ python main.py
       "runtime": "llama-server"
     },
     "ik_llama": {
-      "runtime": "/devel/tools/ik_llama.cpp/build/bin/llama-server",
+      "runtime": "/home/adrian/llama.cpp/build/bin/llama-server",
       "supports_tools": false
     }
   },
   "models": {
-    "Qwen3 14B": {
-      "model_path": "/mnt/win/k/models/unsloth/Qwen3-14B-GGUF/Qwen3-14B-IQ4_NL.gguf",
-      "llama_cpp_runtime": "default",
-      "parameters": {
-        "ctx_size": 20000,
-        "gpu_layers": 99,
-        "no_kv_offload": true,
-        "cache-type-k": "f16",
-        "cache-type-v": "q4_0",
-        "flash-attn": true,
-        "min_p": 0,
-        "top_p": 0.9,
-        "top_k": 20,
-        "temp": 0.6,
-        "no_webui": true
+        "Qwen3 14B 128K": {
+          "model_path": "/home/adrian/models/Qwen3-14B-128K-IQ4_NL.gguf",
+          "llama_cpp_runtime": "default",
+          "parameters": {
+            "ctx_size": 80000,
+            "gpu_layers": 99,
+            "no_kv_offload": true,
+            "cache-type-k": "f16",
+            "cache-type-v": "q4_0",
+            "flash-attn": true,
+            "min_p": 0,
+            "top_p": 0.9,
+            "top_k": 20,
+            "temp": 0.6,
+            "rope-scale": 4,
+            "yarn-orig-ctx": 32768,
+            "jinja": true
+          }
+        }
       }
     },
     "Qwen3 8B": {
