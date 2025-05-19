@@ -79,7 +79,7 @@ def main():
     for k, v in model_info.get('parameters', {}).items():
         print(f"    {k}: {v}")
 
-    # Pobierz ścieżkę do runtime (DYNAMICZNIE bez hardcodowania /home/adrian)
+    # Pobierz ścieżkę do runtime (DYNAMICZNIE bez hardcodowania /home/user)
     llama_server_default = os.path.join(os.path.expanduser("~"), "llama.cpp", "build", "bin", "llama-server")
     runtimes = config.get("llama-runtimes", {})
     runtime_key = model_info.get('llama_cpp_runtime', 'default')
