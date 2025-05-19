@@ -1,5 +1,5 @@
 ## llama-runner
-Llama.cpp runner/swapper i proxy emulujące backend LMStudio / Ollama (dla IntelliJ AI Assistant / GitHub Copilot / VS COde za pomocą RooCode)
+Llama.cpp runner/swapper and proxy that emulates LMStudio / Ollama backends (for IntelliJ AI Assistant / GitHub Copilot)
 
 # Installation
 
