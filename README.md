@@ -9,7 +9,7 @@ Complete guide for WSL2 on Windows 11 describing the installation and configurat
 * using a 30B Q4 model or Qwen3 14B 128K,
 * running via `llama.cpp` with an 80K context patch,
 * integrated with RooCode in VS Code,
-* launched through WSL2 (and additionally via CMake on Windows as a bonus).
+* launched through WSL2
 
 # Environment and Hardware Setup
 
