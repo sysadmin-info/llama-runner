@@ -23,13 +23,13 @@ $ python main.py
       "runtime": "llama-server"
     },
     "ik_llama": {
-      "runtime": "/home/adrian/llama.cpp/build/bin/llama-server",
+      "runtime": "/home/user/llama.cpp/build/bin/llama-server",
       "supports_tools": false
     }
   },
   "models": {
     "Qwen3 14B 128K": {
-      "model_path": "/home/adrian/models/Qwen3-14B-128K-IQ4_NL.gguf",
+      "model_path": "/home/user/models/Qwen3-14B-128K-IQ4_NL.gguf",
       "llama_cpp_runtime": "default",
       "parameters": {
         "ctx_size": 80000,
