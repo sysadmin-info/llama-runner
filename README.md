@@ -1,42 +1,43 @@
 ## llama-runner
 Llama.cpp runner/swapper i proxy emulujące backend LMStudio / Ollama (dla IntelliJ AI Assistant / GitHub Copilot / VS COde za pomocą RooCode)
 
-# Instalacja
+# Installation
 
-Kompletny poradnik dla WSL2 w Windows 11 opisujący instalację i konfigurację lokalnego dużego modleu języukowego LLM:
+Complete guide for WSL2 on Windows 11 describing the installation and configuration of a local Large Language Model (LLM):
 
-* `llamafile` oraz `llama-runner`,
-* z modelem 30B Q4 lub Qwen3 14B 128K,
-* działających przez `llama.cpp` z patchem dla 80K kontekstu,
-* z integracją do RooCode w VS Code,
-* uruchamianych przez WSL2 (i dodatkowo przez CMake na Windows jako bonus).
+* `llamafile` and `llama-runner`,
+* using a 30B Q4 model or Qwen3 14B 128K,
+* running via `llama.cpp` with an 80K context patch,
+* integrated with RooCode in VS Code,
+* launched through WSL2 (and additionally via CMake on Windows as a bonus).
 
-# Środowisko i przygotowanie sprzętu
+# Environment and Hardware Setup
 
-Komputer **AtomMan X7 Ti** z 96 GB RAM i kartą **NVIDIA RTX 3060 (12 GB)** podłączoną przez eGPU DEG1 (OcuLink) jest podstawą. Pracujemy pod **Windows 11**, ale cała instalacja i uruchamianie LLM odbywa się w **WSL2** (Ubuntu 22.04).
+The base machine is an **AtomMan X7 Ti** with 96 GB RAM and an **NVIDIA RTX 3060 (12 GB)** GPU connected via an eGPU DEG1 (OcuLink). We work under **Windows 11**, but the entire installation and LLM execution takes place in **WSL2** (Ubuntu 22.04).
 
-* **Sterowniki GPU:** Na Windows zainstaluj sterownik NVIDIA zgodny z WSL2 i CUDA (najlepiej najnowszy z serii 525+). Upewnij się, że Windows wykrywa GPU, a w WSL uzyskuje się dostęp do GPU (polecenie `nvidia-smi` w WSL2 powinno pokazać RTX 3060). .
-* **Zasilacz i eGPU:** 650 W PSU starczy dla RTX 3060. Brak NVLink oznacza, że nie rozdzielamy obliczeń między karty - całość modelu musi zmieścić się w jednej karcie (lub częściowo na RAM). W praktyce **gpu\_layers=99** (ponad 98%) stawia większość sieci na GPU, co wymaga kwantyzacji i zarządzania pamięcią, by nie przekroczyć 12 GB VRAM.
+* **GPU Drivers:** On Windows, install the NVIDIA driver compatible with WSL2 and CUDA (preferably the latest from the 525+ series). Make sure Windows detects the GPU, and WSL has access to it (the `nvidia-smi` command in WSL2 should show the RTX 3060).
+* **Power Supply and eGPU:** A 650 W PSU is sufficient for an RTX 3060. Since there is no NVLink, we can't split computation across GPUs – the entire model must fit on one card (or partially into RAM). In practice, **gpu\_layers=99** (over 98%) puts most of the network on the GPU, requiring quantization and memory tuning to stay under the 12 GB VRAM limit.
 
-Zainstaluj Windows Subsystem Linux z poziomu PowerShell
+Install Windows Subsystem for Linux via PowerShell:
 
 ```powershell
 dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
 dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
 wsl --set-default-version 2
-```
-W systemie Windows włącz **funkcję WSL2** (PowerShell: `wsl --install`) i dodaj dystrybucję **Ubuntu 22.04** z Microsoft Store. Tak, w Debian 12 nie działa instalacja NVIDIA CUDA 😂 Następnie w WSL:
+````
+
+In Windows, enable the **WSL2 feature** (PowerShell: `wsl --install`) and add the **Ubuntu 22.04** distribution from the Microsoft Store. Yes, NVIDIA CUDA installation doesn't work on Debian 12 😂. Then in WSL:
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential dkms cmake git python3 python3-pip nvidia-cuda-toolkit nvidia-cuda-dev libcurl4-openssl-dev curl jq unzip zipalign
 ```
 
-Po restarcie uruchom polecenie `nvidia-smi`; jeśli widzisz listę procesorów, GPU jest gotowe.
+After rebooting, run the `nvidia-smi` command; if you see a list of processors, the GPU is ready.
 
-## Kompilacja llama.cpp z obsługą CUDA i długiego kontekstu
+## Building llama.cpp with CUDA and long context support
 
-W WSL2 pobierz repozytorium llama.cpp:
+In WSL2, clone the llama.cpp repository:
 
 ```bash
 cd ~
@@ -44,36 +45,36 @@ git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
 ```
 
-*Ważne:* domyślnie llama.cpp obsługuje do 8K lub 32K kontekstu zależnie od modelu. Aby uzyskać *80 000 tokenów*, użyj mechanizmu RoPE-skali i YaRN (eyrap) - opisane poniżej. Nie ma oficjalnego automatycznego patcha 80K, ale można zmienić ustawienia RoPE i YaRN (podejście „rope-scaling yarn”).
+*Important:* By default, llama.cpp supports up to 8K or 32K context depending on the model. To achieve *80,000 tokens*, use RoPE scaling and YaRN (eyrap) – described below. There is no official 80K patch, but you can tweak the RoPE and YaRN settings (the “rope-scaling yarn” approach).
 
-Zbuduj bibliotekę z flagami CUDA:
+Build the library with CUDA flags:
 
 ```bash
 cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_FORCE_CUBLAS=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_CUDA_F16=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j$(nproc)
 ```
 
-* `-DGGML_CUDA=ON` włącza akcelerację GPU (cUBLAS i flash-attn).
-* `-DGGML_CUDA_FA_ALL_QUANTS=ON` pozwala na pełne wsparcie wszystkich kombinacji ilości bitów w pamięci KV dla flash-attn (potrzebne przy mieszaniu Q4/KV). Kompilacja jest wtedy dłuższa, ale niezbędna dla naszych ustawień `cache-type-k=f16`, `cache-type-v=q4_0`.
-* `-DGGML_CUDA_FORCE_CUBLAS=ON` wymusza użycie cUBLAS do mnożeń macierzowych (może przyspieszyć na nowszych GPU kosztem większej pamięci).
-* `-DGGML_CUDA_F16=ON` umożliwia użycie precyzji FP16 w pewnych operacjach CUDA, co poprawia wydajność na nowszych kartach.
+* `-DGGML_CUDA=ON` enables GPU acceleration (cUBLAS and flash-attn).
+* `-DGGML_CUDA_FA_ALL_QUANTS=ON` enables full support for all KV memory bit quant combinations with flash-attn (needed for mixing Q4/KV). It increases compile time but is required for our settings: `cache-type-k=f16`, `cache-type-v=q4_0`.
+* `-DGGML_CUDA_FORCE_CUBLAS=ON` forces matrix multiplications to use cUBLAS (can be faster on newer GPUs at the cost of more memory).
+* `-DGGML_CUDA_F16=ON` enables FP16 precision in some CUDA ops for better performance on modern cards.
 
-Dodatkowo warto ustawić zmienne środowiskowe przy uruchomieniu:
+It's also helpful to set the following environment variables when launching:
 
 ```bash
-export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1     # fallback do RAM, gdy VRAM zabraknie:contentReference[oaicite:3]{index=3}  
-export GGML_CUDA_FORCE_CUBLAS=1             # (na wszelki wypadek)  
+export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1     # fallback to RAM when VRAM is exhausted
+export GGML_CUDA_FORCE_CUBLAS=1              # (just in case)
 ```
 
-`GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` pozwala na używanie pamięci systemowej, gdy GPU nie mieści całego zestawu KV (zapobiega zrywaniu programu przy 80K kontekstu). Bez tego przy tak dużej pamięci KV możemy łatwo przekroczyć 12 GB VRAM.
+`GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` allows fallback to system RAM when the entire KV cache doesn't fit in GPU VRAM (prevents crashes with 80K context). Without it, the 12 GB VRAM can be easily exceeded.
 
-Po kompilacji w katalogu `build/bin` powstaną pliki binarne, w tym `llama-server` (serwer OpenAI-API) i `llama-cli` (narzędzie CLI). Upewnij się, że program poprawnie widzi GPU (`./build/bin/llama-cli --version` powinien pokazać twoją kartę RTX 3060).
+After the build, the `build/bin` directory will contain binaries including `llama-server` (OpenAI-API server) and `llama-cli` (CLI tool). Verify GPU visibility (`./build/bin/llama-cli --version` should show your RTX 3060).
 
-## Metoda 1: **Llama-runner (lokalny serwer OpenAI-API z llama.cpp)**
+## Method 1: **Llama-runner (local OpenAI-API server using llama.cpp)**
 
-Ta metoda to uruchomienie standardowego serwera z projektu llama.cpp (kompatybilnego z OpenAI). Oferuje pełną kontrolę i konfigurację GGUF. Postępujemy tak:
+This method runs the standard OpenAI-compatible server from the llama.cpp project. It offers full control over GGUF configuration. Steps:
 
-1. **Przygotowanie modelu:** Jak wyżej, pobierz wybrany model GGUF (30B Q4 lub Qwen3 14B) i umieść np. w `/home/user/models/model.gguf`.
+1. **Prepare the model:** As before, download your selected GGUF model (30B Q4 or Qwen3 14B) and place it in e.g. `/home/user/models/model.gguf`.
 
 ```bash
 cd ~
@@ -81,9 +82,9 @@ mkdir models && cd models
 wget -O Qwen3-14B-128K-IQ4_NL.gguf https://huggingface.co/unsloth/Qwen3-14B-128K-GGUF/resolve/main/Qwen3-14B-128K-IQ4_NL.gguf
 ```
 
-2. **Uruchomienie serwera:** Użyj skompilowanego pliku `llama-server` z katalogu `build/bin` (powstałego w kroku budowy). Przykład:
+2. **Start the server:** Use the compiled `llama-server` binary from the `build/bin` directory (from the build step). Example:
 
-**Pamiętaj, aby user zastąpić nazwą swojego użytkownika domowego!**
+**Remember to replace `user` with your actual home directory username!**
 
 ```bash
 cd llama.cpp
@@ -101,39 +102,39 @@ cd llama.cpp
   --port 8080
 ```
 
-   Tutaj:
+Here:
 
-   * `-m` wskazuje ścieżkę do modelu GGUF,
-   * reszta flag (`--ctx-size`, `--gpu-layers`, itd.) identycznie jak wyżej,
-   * `--port 8080` ustawia nasłuch na porcie 8080 (można zmienić).
+* `-m` points to the GGUF model path,
+* the rest of the flags (`--ctx-size`, `--gpu-layers`, etc.) are as explained above,
+* `--port 8080` sets the listening port (changeable).
 
-   Serwer startuje i czeka na zapytania na `http://localhost:8080/v1/chat/completions` i innych końcówkach OpenAI. Możesz go testować (np. `curl` z JSONem, patrz \[70] lub \[120] dla przykładu struktury API).
+The server starts and waits for requests at `http://localhost:8080/v1/chat/completions` and other OpenAI endpoints. You can test it (e.g. with `curl` using JSON – see \[70] or \[120] for example request format).
 
-3. **Test lokalny (opcjonalnie):** Możesz sprawdzić działanie przez `curl` (opcja `-d` JSON z wiadomościami jak w OpenAI) lub za pomocą narzędzi typu Postman. Przykładowo:
+3. **Local test (optional):** You can test it using `curl` (with `-d` JSON like OpenAI) or tools like Postman. Example:
 
-   ```bash
-   curl http://localhost:8080/v1/chat/completions \
-     -H "Content-Type: application/json" \
-     -d '{
-           "model": "any-model",
-           "messages": [
-             {"role": "system", "content": "Jesteś asystentem kodu."},
-             {"role": "user", "content": "Napisz funkcję w Pythonie sortującą listę liczb."}
-           ]
-         }'
-   ```
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "any-model",
+        "messages": [
+          {"role": "system", "content": "You are a code assistant."},
+          {"role": "user", "content": "Write a Python function to sort a list of numbers."}
+        ]
+      }'
+```
 
-   Model zwróci JSON z odpowiedzią pod kluczem `"choices":[{"message":{"content":...}}]`.
+The model will return a JSON response with `"choices":[{"message":{"content":...}}]`.
 
-> **Praktyczne uwagi:** Z racji braku NVLink i ograniczonej VRAM użycie `--no-kv-offload` i podanych kwantyzacji (`k=f16`, `v=q4_0`) jest kluczowe, by model „zmieścił się” w 12 GB. Włączenie **FlashAttention** (`--flash-attn`) przyspieszy obliczenia na GPU. Jeśli zauważysz błędy pamięci, spróbuj także zmienić `GGML_CUDA_FORCE_MMQ` na `1` (w środowisku), co zmniejszy zużycie VRAM kosztem nieco wolniejszych obliczeń. Upewnij się też, że masz włączoną obsługę *Unified Memory* (`GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`), jak pokazano wyżej.
+> **Practical tips:** Due to the lack of NVLink and limited VRAM, using `--no-kv-offload` and the specified quant settings (`k=f16`, `v=q4_0`) is key to fitting the model within 12 GB. Enabling **FlashAttention** (`--flash-attn`) speeds up GPU computation. If memory errors occur, try setting `GGML_CUDA_FORCE_MMQ=1` (as an env var), which reduces VRAM use at the cost of slightly slower performance. Ensure *Unified Memory* (`GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`) is enabled as shown above.
 
-## Metoda 2: **llama-runner** (samodzielne uruchomienie modelu w sposób bardziej uproszczony)
+## Method 2: **llama-runner** (standalone, simplified local launcher)
 
-Ta metoda to uruchomienie runnera z projektu [llama-runner ](https://github.com/sysadmin-info/llama-runner.git). Jest to fork projektu [llama-runner by Piotr Wilkin](https://github.com/pwilkin/llama-runner.git), który został zmodyfikowany przeze mnie, aby móc uruchamiać go z poziomu WSL2.
+This method runs the launcher from the [llama-runner project](https://github.com/sysadmin-info/llama-runner.git). It’s a fork of [llama-runner by Piotr Wilkin](https://github.com/pwilkin/llama-runner.git), modified by me to work under WSL2.
 
-Zakładam, że wszystkie kroki przed metodą pierwszą zostały wykonane.
+Assumes all prior setup steps (before Method 1) have been completed.
 
-Sklonuj repozytorium:
+Clone the repository:
 
 ```bash
 git clone https://github.com/sysadmin-info/llama-runner.git
@@ -145,33 +146,29 @@ pip install -r requirements.txt
 python3 main.py
 ```
 
+## Integration with VS Code (RooCode)
 
-## Integracja z VS Code (RooCode)
+To use the model as an LLM backend in VS Code (e.g., with **RooCode**, formerly RooCline):
 
-Aby korzystać z modelu jako backendu LLM w VS Code (np. z rozszerzeniem **RooCode**, dawniej RooCline):
+1. **Install RooCode:** Open Extensions in VS Code and install “Roo Code” by RooVeterinaryInc. A RooCode icon will appear in the sidebar.
 
-1. **Zainstaluj RooCode:** Wejdź w Extensions w VS Code i zainstaluj „Roo Code” autorstwa RooVeterinaryInc. Po instalacji pojawi się ikona RooCode w panelu bocznym.
-
-2. **Konfiguracja połączenia:** RooCode pozwala podłączyć się do dowolnego „OpenAI-compatible” endpointu. W ustawieniach (lub pliku `settings.json` VS Code) wpisz:
+2. **Connection setup:** RooCode allows connection to any "OpenAI-compatible" endpoint. In the settings (or in your `settings.json` file), enter:
 
    ```json
    "roocode.openai_api_base": "http://localhost:8080/v1",
-   "roocode.openai_model": "qwen3-14b-128k",   // nazwa modelu może być dowolna, serwer ignoruje tę wartość bo bierze ją z config.json
+   "roocode.openai_model": "qwen3-14b-128k",   // model name can be anything, the server ignores it and reads from config.json
    "roocode.openai_api_key": ""
    ```
 
-   * `openai_api_base` wskazuje adres Twojego serwera llama.cpp (z plusem ścieżki `/v1`).
-   * `openai_model` w RooCode musi być podane, ale serwer llama.cpp nie używa tej wartości (może być `any-model`).
-   * `openai_api_key` zostaw puste – lokalny serwer nie wymaga autoryzacji.
+   * `openai_api_base` points to your llama.cpp server (add `/v1` path).
+   * `openai_model` must be provided in RooCode, but the llama.cpp server doesn’t use it (can be `any-model`).
+   * `openai_api_key` should be left empty – the local server does not require auth.
 
-   W niektórych wersjach może to być w GUI ustawień: wybierz *AI Provider → Add Provider → Generic OpenAI*, i tam podaj URL `http://localhost:8080` oraz klucz (pusty).
+   In some versions, you can configure this via GUI: choose *AI Provider → Add Provider → Generic OpenAI*, and enter `http://localhost:8080` and leave the key field blank.
 
-3. **Używanie:** Po konfiguracji RooCode będzie wysyłać zapytania do lokalnego serwera, a model odpowiadać jak zdalny. Nie musisz używać `curl` ani osobnego interfejsu – wszystkie zapytania generowane są wewnętrznie (np. w oknie czatu RooCode).
+3. **Usage:** Once configured, RooCode will send requests to the local server and the model will respond as if it were remote. You don’t need to use `curl` or a separate UI – all requests are generated internally (e.g., within RooCode’s chat interface).
 
-> **Uwaga:** W praktyce użytkownicy reportują, że konfiguracja RooCode z własnym serwerem czasem wymaga manualnego wskazania URL w ustawieniach. Ważne, by serwer `llama-server` (lub `llamafile --server`) działał przed uruchomieniem sesji w VS Code.
-
-
-
+> **Note:** In practice, users report that RooCode sometimes needs the server URL to be set manually. Ensure that the `llama-server` (or `llamafile --server`) is running before starting the VS Code session.
 
 # Sample config file
 
