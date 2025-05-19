@@ -25,7 +25,7 @@ def choose_model(models):
         print("Invalid choice. Try again.")
 
 def model_to_args(model_info, extra_args=None):
-    # Mapowanie parametrów z config.json na flagi CLI
+    # Mapowanie parametrów z config.json na flagi CLI (poprawka na cache-type-k, cache-type-v)
     param_map = {
         "ctx_size": "--ctx-size",
         "gpu_layers": "--gpu-layers",
@@ -49,12 +49,8 @@ def model_to_args(model_info, extra_args=None):
             if isinstance(val, bool) and val:
                 args.append(cli_flag)
             elif not isinstance(val, bool):
-                # --flag value lub --flag value1 value2 jeśli "cache-type"
-                if key.startswith("cache-type"):
-                    args.extend(cli_flag.split() + [str(val)])
-                else:
-                    args.append(cli_flag)
-                    args.append(str(val))
+                args.append(cli_flag)
+                args.append(str(val))
     if extra_args:
         args += extra_args
     return args
