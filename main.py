@@ -79,13 +79,14 @@ def main():
     for k, v in model_info.get('parameters', {}).items():
         print(f"    {k}: {v}")
 
-    # Pobierz ścieżkę do runtime
+    # Pobierz ścieżkę do runtime (DYNAMICZNIE bez hardcodowania /home/adrian)
+    llama_server_default = os.path.join(os.path.expanduser("~"), "llama.cpp", "build", "bin", "llama-server")
     runtimes = config.get("llama-runtimes", {})
     runtime_key = model_info.get('llama_cpp_runtime', 'default')
-    runtime_path = runtimes.get(runtime_key, {}).get("runtime", "/home/adrian/llama.cpp/build/bin/llama-server")
+    runtime_path = runtimes.get(runtime_key, {}).get("runtime", llama_server_default)
 
     if not os.path.isabs(runtime_path):
-        runtime_path = "/home/adrian/llama.cpp/build/bin/llama-server"
+        runtime_path = llama_server_default
 
     # Zbuduj listę argumentów
     cli_args = [runtime_path, "-m", model_info["model_path"]]
