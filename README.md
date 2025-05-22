@@ -26,7 +26,7 @@ dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /nores
 wsl --set-default-version 2
 ````
 
-In Windows, enable the **WSL2 feature** (PowerShell: `wsl --install`) and add the **Ubuntu 22.04** distribution from the Microsoft Store. Yes, NVIDIA CUDA installation doesn't work on Debian 12 😂. Then in WSL:
+In Windows, enable the **WSL2 feature** (PowerShell: `wsl --install`) and add the **Ubuntu 22.04 / 24.04 or newer** distribution from the Microsoft Store. Yes, NVIDIA CUDA installation doesn't work on Debian 12 😂. Then in WSL:
 
 ```bash
 sudo apt update
